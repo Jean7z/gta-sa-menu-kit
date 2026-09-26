@@ -1,0 +1,7 @@
+# Artefactos de build (regenerables con ndk-build)
+/obj/
+/libs/
+
+# Termux / editor
+*.swp
+*~
