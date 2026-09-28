@@ -6,11 +6,19 @@
 extern "C" {
 #endif
 
-#define MENUKIT_API_VERSION 3
+#define MENUKIT_API_VERSION 4
 
 typedef void (*MenuKit_OnReleaseCallback)(void* userdata);
 
-/* API v3 - resolved by symbol from AML_PSDK_MenuKit64.so / AML_PSDK_MenuKit.so
+/* API v4 - resolved by symbol from AML_PSDK_MenuKit64.so / AML_PSDK_MenuKit.so
+   v4 changes: SetText(handle, text) — render a label onto an existing button
+   with the engine's embedded 5x7 bitmap font (Plan B; NO CFont, which does not
+   composite in this fork). The label texture replaces the button's sprite and
+   is either composited OVER the custom icon's pixels when the widget has one,
+   or drawn centered on a generated dark panel sized to the widget's live
+   on-screen rect. New member is appended at the END of the struct so old
+   clients compiled against v3 keep working (they only read fields by offset;
+   version check is best-effort).
    v3 changes: AddButton takes an optional custom icon (absolute PNG path; NULL
    = the game's default button texture).
    v2 changes: AddButton takes a menu id; OpenMenu/CloseMenu manage the menu
@@ -56,6 +64,21 @@ typedef struct MenuKitAPI
        enough free pool slots for the whole group — the menu is NOT opened). */
     int (*OpenMenu)(int menu);
     int (*CloseMenu)(void);
+
+    /* v4: Set a textual label on an existing button (handle from AddButton).
+       text: NUL-terminated ASCII string (chars 0x20..0x7E; others render as
+       '?'), encoded with the engine's embedded 5x7 bitmap font. When the
+       widget has a custom icon, the label is baked ON TOP of the icon's pixel
+       data (the same texture that Draw renders — guaranteed composition, on
+       top of the sprite). Without an icon, the engine generates a dark
+       translucent panel sized to the widget's live on-screen rect and draws
+       the text centered on it, dropping the game's default texture. The
+       label replaces the button's sprite (it always wins over any icon).
+       Safe to call before the widget is built (registered but deferred) and
+       at runtime; the engine applies it on the next game frame. Pass NULL or
+       "" to clear the label (restores the underlying icon / default texture
+       on the next frame). */
+    void (*SetText)(void* handle, const char* text);
 } MenuKitAPI;
 
 /* Framework entrypoint. The framework .so exports this; client mods resolve it. */

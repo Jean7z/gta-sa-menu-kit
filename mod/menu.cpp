@@ -16,6 +16,13 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+/* Plan B: fuente bitmap 5x7 embebida (dominio publico, layout Adafruit GFX).
+   El texto NO usa CFont (experimento Tarea 0: CFont no compone en este fork y
+   el flush rompe el HUD). En su lugar se rasteriza aqui en un buffer RGBA y se
+   sube por el MISMO pipeline de iconos (RwImage -> raster 0x10 -> clean textura),
+   horneado en la textura que Draw pinta -> composicion garantizada. */
+#include "font5x7.h"
+
 #define MAX_POOL_SLOTS 190              /* game's widget pool size (MAX_WIDGETS_GAME) */
 #define OUR_WIDGET_LIMIT 16
 #define MENU_STACK_MAX 8                /* nested OpenMenu depth (root group 0 is implicit at depth 0) */
@@ -76,6 +83,16 @@ static void* (*s_pfnRwRasterGetPixels)(void*) = NULL;
 static void* (*s_pfnRwRasterLock)(void*, unsigned char, int) = NULL;
 static void  (*s_pfnRwRasterUnlock)(void*) = NULL;
 
+/* Real screen size in pixels (OS_ScreenGetWidth/Height, resolved at init like
+   MenuVSL does). Used to project the widget's VIRTUAL 640x448 position to
+   real pixels for the label panel — the widget's own live rect (+0x2c..+0x38)
+   is a 1e6 sentinel until the game activates the widget (observed in the pool
+   dump), so reading it produces absurd h and silently fails the raster. */
+static int (*s_pfnOS_ScreenGetWidth)(void)  = NULL;
+static int (*s_pfnOS_ScreenGetHeight)(void) = NULL;
+static float s_screenW = 640.0f;   /* fallbacks until resolved */
+static float s_screenH = 448.0f;
+
 /* Icon cache: same path -> same RwTexture (shared across buttons). Created
    once and NEVER destroyed by the mod: we write sprite[0] (+0x10) directly and
    the widget is never SetTexture'd again, so no double-free. ponytail: the
@@ -99,6 +116,13 @@ struct IconEntry
 };
 static std::map<std::string, IconEntry> s_iconCache;
 
+/* Plan B: label-texture cache. Same path-key trick as s_iconCache but keyed
+   by the label string; rendered once and NEVER destroyed by the mod (same
+   ponytail as icons: textures live until the game closes). Same liveness
+   machinery: texture block recycling by the game is detected via the raster
+   fingerprint re-check so the pump can re-render fresh. */
+static std::map<std::string, IconEntry> s_textCache;
+
 /* Widget registry */
 struct WidgetEntry
 {
@@ -112,6 +136,8 @@ struct WidgetEntry
     char        texture[64];  /* saved so the widget can be (re)built lazily */
     char        icon[256];    /* custom icon PNG path (absolute device path); empty = game default */
     void*       iconTex;      /* cached custom RwTexture from MenuKit_LoadIcon; NULL = none/failed */
+    char        text[128];    /* Plan B label: rendered by SetText into a texture ("" = no label) */
+    void*       textTex;      /* cached label texture from MenuKit_RenderTextTexture */
     WidgetPosition pos;
 };
 static WidgetEntry s_widgets[OUR_WIDGET_LIMIT];
@@ -358,6 +384,231 @@ static void* MenuKit_LoadIcon(const char* path)
     return NULL;
 }
 
+/* ---- Plan B: label textures (NO CFont — CFont no compone en este fork) ----
+   Same upload path as MenuKit_LoadIcon (findRasterFormat 0x10 -> rasterCreate
+   -> setFromImage -> textureCreate -> refcount +0x64), factored out so the
+   icon path and the label path share ONE verified pipeline. The label is
+   rasterized with the embedded 5x7 bitmap font and COMPOSITED either over the
+   widget's icon PNG pixels (text inside the button image -> guaranteed on
+   top) or over a generated dark panel sized to the widget's live on-screen
+   rect (floats l/t/r/b at +0x2c..+0x38, real pixels). */
+
+/* Upload an RGBA8 buffer to a fresh RwTexture (game's own pipeline). The
+   buffer is consumed (copied by RwRasterSetFromImage, then freed here).
+   outRas (optional) receives the raster for liveness fingerprinting.
+   Returns the texture, or NULL on failure. */
+static void* MenuKit_UploadRGBA(stbi_uc* px, int w, int h, void** outRas)
+{
+    if(!px || w <= 0 || h <= 0 || !s_pfnRwImageCreate || !s_pfnRwImageDestroy ||
+       !s_pfnRwImageFindRasterFormat || !s_pfnRwRasterCreate || !s_pfnRwRasterDestroy ||
+       !s_pfnRwRasterSetFromImage || !s_pfnRwTextureCreate)
+    {
+        if(px) stbi_image_free(px);
+        return NULL;
+    }
+    void* img = s_pfnRwImageCreate(w, h, 32);
+    if(!img) { stbi_image_free(px); return NULL; }
+    RwImageLayout* il = (RwImageLayout*)img;
+    il->cpPixels = px;          /* backend copies it into the raster */
+    il->stride = w * 4;         /* RGBA8 rows advance by w*4 */
+    void* tex = NULL;
+    int ow = 0, oh = 0, od = 0, of = 0;
+    if(s_pfnRwImageFindRasterFormat(img, 0x10, &ow, &oh, &od, &of))
+    {
+        void* ras = s_pfnRwRasterCreate(ow, oh, od, of);
+        if(ras)
+        {
+            if(s_pfnRwRasterSetFromImage(ras, img))
+            {
+                il->cpPixels = NULL; /* copied; we free px now */
+                stbi_image_free(px); px = NULL;
+                s_pfnRwImageDestroy(img); img = NULL;
+                tex = s_pfnRwTextureCreate(ras);
+                if(tex)
+                {
+                    if(s_pfnRwTextureSetName) s_pfnRwTextureSetName(tex, "MenuKitLabel");
+                    /* mirror the game's refcount bump so streaming never
+                       recycles our block (see LoadIcon comment) */
+                    if(*(uint32_t*)((uintptr_t)tex + 0x64) < 0x0fffffff)
+                        *(uint32_t*)((uintptr_t)tex + 0x64) += 1;
+                    if(outRas) *outRas = ras;
+                    return tex;
+                }
+            }
+            s_pfnRwRasterDestroy(ras);
+        }
+    }
+    if(img) s_pfnRwImageDestroy(img);
+    if(px)  stbi_image_free(px);
+    return NULL;
+}
+
+/* Rasterize a label into a fresh RGBA8 buffer with the embedded 5x7 font.
+   scale: glyph multiplier (1 = raw 5x7). Returns the buffer (caller frees
+   with stbi_image_free), or NULL. */
+static stbi_uc* MenuKit_RasterizeText(const char* text, int scale,
+                                      unsigned r, unsigned g, unsigned b, unsigned a)
+{
+    if(!text || !*text || scale < 1) return NULL;
+    if(scale > 16) scale = 16;
+    size_t len = strlen(text);
+    int w = (int)len * 6 * scale;   /* 5 cols + 1 spacing per glyph */
+    int h = 8 * scale;              /* 7 rows + 1 */
+    if(w < 1 || h < 1) return NULL;
+    stbi_uc* px = (stbi_uc*)calloc((size_t)w * (size_t)h * 4, 1);
+    if(!px) return NULL;
+    for(size_t i = 0; i < len; ++i)
+    {
+        unsigned char c = (unsigned char)text[i];
+        if(c < 0x20 || c > 0x7e) c = '?';
+        const unsigned char* glyph = s_font5x7[c - 0x20];
+        for(int col = 0; col < 5; ++col)
+        {
+            unsigned char bits = glyph[col];
+            for(int row = 0; row < 7; ++row)
+            {
+                if(!((bits >> row) & 1)) continue;
+                int x0 = (int)i * 6 * scale + col * scale;
+                int y0 = row * scale;
+                for(int sy = 0; sy < scale; ++sy)
+                    for(int sx = 0; sx < scale; ++sx)
+                    {
+                        size_t off = ((size_t)(y0 + sy) * w + (size_t)(x0 + sx)) * 4;
+                        px[off + 0] = (stbi_uc)r;
+                        px[off + 1] = (stbi_uc)g;
+                        px[off + 2] = (stbi_uc)b;
+                        px[off + 3] = (stbi_uc)a;
+                    }
+            }
+        }
+    }
+    return px;
+}
+
+/* Full label pipeline: build (or fetch cached) the RwTexture that carries the
+   label, composited per the rules above. Called from the pump only (RW
+   symbols + live screen dims are runtime things). Cached by (icon|text) — the
+   friendly reload path mirrors LoadIcon's liveness (member + raster check).
+   The widget param is the registry entry (not the game object): Variant B
+   projects the widget's VIRTUAL 640x448 position to real pixels instead of
+   reading the game widget's live rect (+0x2c..+0x38), which our widgets keep
+   at the 1e6 sentinel (the game never updates it for touch-immune buttons:
+   the pool dump showed 1e6/-1e6 rects and the resulting absurd h silently
+   failed the raster). */
+static void* MenuKit_RenderTextTexture(const char* text, const char* icon, const WidgetEntry& e)
+{
+    if(!text || !*text) return NULL;
+    if(!s_pfnRwImageCreate || !s_pfnRwImageFindRasterFormat ||
+       !s_pfnRwRasterCreate || !s_pfnRwRasterSetFromImage || !s_pfnRwTextureCreate)
+        return NULL;
+
+    char key[512];
+    snprintf(key, sizeof(key), "label:%s|%s", icon ? icon : "", text);
+    auto it = s_textCache.find(key);
+    if(it != s_textCache.end())
+    {
+        const IconEntry& c = it->second;
+        if(c.ok)
+        {
+            if(c.tex && *(void**)c.tex == c.ras) return c.tex;
+            logger->Info("MenuKit: label '%s' recycled by game, re-rendering", text);
+            s_textCache.erase(it);
+        }
+        else
+        {
+            return c.tex; /* fingerprint unavailable; trust the cached pointer */
+        }
+    }
+
+    stbi_uc* px = NULL;
+    int w = 0, h = 0;
+    if(icon && *icon)
+    {
+        /* Variant A: compose the label OVER the icon's own pixels. The text is
+           baked into the button image itself — composition on top of the
+           sprite is guaranteed because this texture is what Draw renders. */
+        int ch = 0;
+        px = stbi_load(icon, &w, &h, &ch, 4);
+        if(!px) logger->Error("MenuKit: label '%s': icon '%s' not decodable", text, icon);
+    }
+    if(!px)
+    {
+        /* Variant B: generated dark panel sized to the widget's on-screen
+           rect, derived from the VIRTUAL 640x448 position the game dials to
+           screen space (left/right = (OriginX ± ScaleX)*screenW/640,
+           top/bottom = (OriginY ± ScaleY)*screenH/448 — same projection the
+           game's CWidget::Update applies to native widgets). */
+        float l = (e.pos.m_fOriginX - e.pos.m_fScaleX) * s_screenW / 640.0f;
+        float r = (e.pos.m_fOriginX + e.pos.m_fScaleX) * s_screenW / 640.0f;
+        float t = (e.pos.m_fOriginY - e.pos.m_fScaleY) * s_screenH / 448.0f;
+        float b = (e.pos.m_fOriginY + e.pos.m_fScaleY) * s_screenH / 448.0f;
+        w = (int)(r - l); h = (int)(b - t);
+        if(w < 8) w = 8;
+        if(h < 8) h = 8;
+        px = (stbi_uc*)calloc((size_t)w * (size_t)h * 4, 1);
+        if(!px)
+        {
+            logger->Error("MenuKit: label '%s': calloc %dx%d failed", text, w, h);
+            return NULL;
+        }
+        for(int i = 0; i < w * h; ++i) /* dark translucent panel */
+        {
+            px[i*4 + 0] = 0; px[i*4 + 1] = 0; px[i*4 + 2] = 0; px[i*4 + 3] = 0x8C;
+        }
+    }
+
+    /* Fit the text to ~70% of the panel width, centered. Zero-padding on the
+       glyph buffer becomes transparent when composited (alpha 0 skip). */
+    size_t len = strlen(text);
+    int scale = 1;
+    if(len > 0 && w > 0 && h > 0)
+    {
+        int fitW = (int)((float)w * 0.7f) / (int)(len * 6);
+        int fitH = (int)((float)h * 0.9f) / 8;
+        int fit = fitW < fitH ? fitW : fitH;
+        if(fit > 1) scale = fit > 16 ? 16 : fit;
+    }
+    stbi_uc* glyphs = MenuKit_RasterizeText(text, scale, 255, 255, 255, 255);
+    if(glyphs)
+    {
+        int gw = (int)len * 6 * scale;
+        int gh = 8 * scale;
+        int x0 = (w - gw) / 2; if(x0 < 0) x0 = 0;
+        int y0 = (h - gh) / 2; if(y0 < 0) y0 = 0;
+        for(int gy = 0; gy < gh && y0 + gy < h; ++gy)
+        {
+            for(int gx = 0; gx < gw && x0 + gx < w; ++gx)
+            {
+                size_t so = ((size_t)gy * gw + (size_t)gx) * 4;
+                if(glyphs[so + 3] == 0) continue;   /* glyph pixel or padding */
+                size_t dst = ((size_t)(y0 + gy) * w + (size_t)(x0 + gx)) * 4;
+                px[dst + 0] = glyphs[so + 0];
+                px[dst + 1] = glyphs[so + 1];
+                px[dst + 2] = glyphs[so + 2];
+                px[dst + 3] = glyphs[so + 3];
+            }
+        }
+        stbi_image_free(glyphs);
+    }
+
+    void* ras = NULL;
+    void* tex = MenuKit_UploadRGBA(px, w, h, &ras);
+    if(!tex)
+    {
+        logger->Error("MenuKit: label '%s': upload failed (%dx%d)", text, w, h);
+        return NULL;
+    }
+    IconEntry c;
+    memset(&c, 0, sizeof(c));
+    c.tex = tex;
+    c.ras = ras;
+    c.ok  = (ras && *(void**)tex == ras);
+    s_textCache[key] = c;
+    logger->Info("MenuKit: label '%s' rendered (%dx%d -> %p, scale %d%s)",
+                 text, w, h, tex, scale, icon && *icon ? ", over icon" : ", panel");
+    return tex;
+}
+
 /* Build the real CWidgetButton into the pool. Safe only once the game is
    running (TextureDatabaseRuntime exists); during ON_MOD_LOAD it would SEGV
    inside GetTexture, so this is called from the CGame_Process pump, never
@@ -403,6 +654,20 @@ static void MenuKit_BuildWidget(WidgetEntry& e)
             *field = tex;
             e.iconTex = tex;
             logger->Info("MenuKit: widget '%s' uses custom icon", e.texture);
+        }
+    }
+    /* Plan B label: like the icon, swap sprite[0] post-ctor. The label
+       texture is either the icon pixels + text baked in, or a generated dark
+       panel (no icon). It intentionally WINS over the icon (it includes it). */
+    if(e.text[0])
+    {
+        void* tex = MenuKit_RenderTextTexture(e.text, e.icon[0] ? e.icon : NULL, e);
+        if(tex)
+        {
+            void** field = (void**)((uintptr_t)mem + 0x10);
+            *field = tex;
+            e.textTex = tex;
+            logger->Info("MenuKit: widget '%s' label applied", e.texture);
         }
     }
     /* Native recipe sets +0xa4 = param4 = 1 already via the ctor; nothing more
@@ -524,6 +789,34 @@ DECL_HOOKv(CGame_Process, void)
             }
         }
 
+        /* Plan B: re-protect the label exactly like the icon. RenderTextTexture
+           is cached (key = texture|text) and liveness-checked (member pointer
+           vs stored raster) inside, so this is cheap when nothing was stolen;
+           when the game recycled the block it re-renders and we swap the new
+           texture in. Also covers SetText() called at runtime: the new text is
+           marked textTex=NULL (force) and this block rebuilds it on the next
+           frame. The label always wins sprite[0] over the icon (it includes
+           the icon pixels when one is set). */
+        if(e.widget && e.text[0])
+        {
+            void* want = MenuKit_RenderTextTexture(e.text, e.icon[0] ? e.icon : NULL, e);
+            if(want != e.textTex)
+            {
+                if(e.textTex)
+                    logger->Info("MenuKit: label refreshed on '%s': %p -> %p", e.texture, e.textTex, want);
+                e.textTex = want;
+            }
+            if(e.textTex)
+            {
+                void** field = (void**)((uintptr_t)e.widget + 0x10);
+                if(*field != e.textTex)
+                {
+                    *field = e.textTex;
+                    logger->Info("MenuKit: label re-protected on '%s' (slot %d)", e.texture, e.slot);
+                }
+            }
+        }
+
         /* Dispatch: release = falling edge of IsTouched. IsTouched is a LEVEL
            signal (true while the finger is down) — the game itself drives our
            press animation off this same per-widget query (vtable+0xa0).
@@ -606,8 +899,8 @@ DECL_HOOKv(CGame_Process, void)
                              rb ? *(const uint32_t*)(rb + 0x18) : 0,
                              rb ? *(const uint32_t*)(rb + 0x1c) : 0, qws);
             }
-        }
-    }
+}
+     }
 }
 
 static bool MenuKit_Init(IAML* aml)
@@ -626,7 +919,7 @@ static bool MenuKit_Init(IAML* aml)
     s_pfnRwImageDestroy          = (void(*)(void*))aml->GetSym(pGameHandle, "_Z14RwImageDestroyP7RwImage");
     s_pfnRwImageFindRasterFormat = (int(*)(void*,int,int*,int*,int*,int*))aml->GetSym(pGameHandle, "_Z23RwImageFindRasterFormatP7RwImageiPiS1_S1_S1_");
     s_pfnRwRasterCreate          = (void*(*)(int,int,int,int))aml->GetSym(pGameHandle, "_Z14RwRasterCreateiiii");
-    s_pfnRwRasterDestroy         = (void(*)(void*))aml->GetSym(pGameHandle, "_Z14RwRasterDestroyP8RwRaster");
+    s_pfnRwRasterDestroy         = (void(*)(void*))aml->GetSym(pGameHandle, "_Z15RwRasterDestroyP8RwRaster");
     s_pfnRwRasterSetFromImage    = (int(*)(void*,void*))aml->GetSym(pGameHandle, "_Z20RwRasterSetFromImageP8RwRasterP7RwImage");
     s_pfnRwTextureCreate         = (void*(*)(void*))aml->GetSym(pGameHandle, "_Z15RwTextureCreateP8RwRaster");
     s_pfnRwTextureDestroy        = (void(*)(void*))aml->GetSym(pGameHandle, "_Z16RwTextureDestroyP9RwTexture");
@@ -645,6 +938,21 @@ static bool MenuKit_Init(IAML* aml)
     s_pfnRwRasterGetPixels       = (void*(*)(void*))aml->GetSym(pGameHandle, "_Z17RwRasterGetPixelsP8RwRaster");
     s_pfnRwRasterLock            = (void*(*)(void*,unsigned char,int))aml->GetSym(pGameHandle, "_Z12RwRasterLockP8RwRasterhi");
     s_pfnRwRasterUnlock          = (void(*)(void*))aml->GetSym(pGameHandle, "_Z14RwRasterUnlockP8RwRaster");
+
+    /* Real screen size for the label panel projection (MenuVSL proves these
+       exports exist: _Z17OS_ScreenGetWidthv / _Z18OS_ScreenGetHeightv). */
+    s_pfnOS_ScreenGetWidth       = (int(*)(void))aml->GetSym(pGameHandle, "_Z17OS_ScreenGetWidthv");
+    s_pfnOS_ScreenGetHeight      = (int(*)(void))aml->GetSym(pGameHandle, "_Z18OS_ScreenGetHeightv");
+    if(s_pfnOS_ScreenGetWidth && s_pfnOS_ScreenGetHeight)
+    {
+        int sw = s_pfnOS_ScreenGetWidth(), sh = s_pfnOS_ScreenGetHeight();
+        if(sw > 0 && sh > 0) { s_screenW = (float)sw; s_screenH = (float)sh; }
+        logger->Info("MenuKit: screen %dx%d (real px)", (int)s_screenW, (int)s_screenH);
+    }
+    else
+    {
+        logger->Error("MenuKit: OS_ScreenGetWidth/Height not resolved - label panels use 640x448 fallback");
+    }
     logger->Info("MenuKit: pixel accessors GetPixels=%p Lock=%p Unlock=%p",
                  s_pfnRwRasterGetPixels, s_pfnRwRasterLock, s_pfnRwRasterUnlock);
 
@@ -771,13 +1079,31 @@ static int MenuKit_CloseMenu(void)
     return 0;
 }
 
+/* Plan B (v4): SetText. Changes the label of an existing widget (POST-build
+   or deferred — both work). Safe before the widget exists: the pump renders
+   the label from e.text in the same re-protect pass that builds widgets, so
+   this only flips a string buffer and lets the deterministic next-frame pump
+   do the RenderWare work. textTex=NULL forces a re-render of the cached
+   label (the texture carries the old text, so the cache key must change). */
+static void MenuKit_SetText(void* handle, const char* text)
+{
+    if(!handle) return;
+    WidgetEntry* e = (WidgetEntry*)handle;
+    memset(e->text, 0, sizeof(e->text));
+    if(text) strncpy(e->text, text, sizeof(e->text) - 1);
+    e->text[sizeof(e->text) - 1] = '\0';
+    e->textTex = NULL;  /* force rebuild; old texture may be game-owned now */
+    logger->Info("MenuKit: widget '%s' text set to '%s'", e->texture, e->text[0] ? e->text : "(none)");
+}
+
 static MenuKitAPI g_api = {
     MENUKIT_API_VERSION,
     MenuKit_AddButton,
     MenuKit_RemoveWidget,
     MenuKit_IsReleased,
     MenuKit_OpenMenu,
-    MenuKit_CloseMenu
+    MenuKit_CloseMenu,
+    MenuKit_SetText
 };
 
 const MenuKitAPI* GetMenuAPI(void) { return &g_api; }

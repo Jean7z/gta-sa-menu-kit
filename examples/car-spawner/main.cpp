@@ -98,6 +98,16 @@ ON_MOD_LOAD()
     if(!root) logger->Error("CarSpawner: could not add root widget");
     else logger->Info("CarSpawner: root button added (tap to open car menu)");
 
+    /* v4: label the root button. No custom icon -> the engine draws a dark
+       panel sized to the widget's live rect and prints the text centered.
+       Without a label the root would show the game's "shoot" texture; the
+       label always wins sprite[0]. */
+    if(s_api->version >= 4 && root)
+    {
+        s_api->SetText(root, "SPAWN");
+        logger->Info("CarSpawner: root labeled SPAWN (v4 SetText)");
+    }
+
     /* v3: custom-icon button, below the root one. PNG lives in the mods folder,
        loaded once and cached by the engine (replicate the game's own texture
        pipeline). 128x128 source, same ballpark as the native UI icons so the
@@ -106,6 +116,15 @@ ON_MOD_LOAD()
                                    "/storage/emulated/0/Android/data/com.rockstargames.gtasa/mods/icon-test.png");
     if(!itest) logger->Error("CarSpawner: could not add icon-test widget");
     else logger->Info("CarSpawner: icon-test button added (custom PNG icon)");
+
+    /* v4: label the icon-test button TOO. It has a custom icon, so the text is
+       baked ON TOP of the icon's own pixels (composition over the PNG). This
+       exercises the icon-composite variant of SetText. */
+    if(s_api->version >= 4 && itest)
+    {
+        s_api->SetText(itest, "TEST");
+        logger->Info("CarSpawner: icon-test labeled TEST (over icon)");
+    }
 
     /* MENU 1: four spawn buttons stacked vertically in the 640x448 space,
        centered on x=320. Scale 40 -> 80px tall, stepped by 95px -> clear
@@ -122,5 +141,9 @@ ON_MOD_LOAD()
                              kCars[i].name, kCars[i].model);
         else logger->Info("CarSpawner: %s (%d) button added at y=%g",
                           kCars[i].name, kCars[i].model, y);
+        /* v4: label each car button with its model name. No icon -> dark
+           panel + centered text, so the player sees which car is which
+           instead of picking by position. */
+        if(s_api->version >= 4 && h) s_api->SetText(h, kCars[i].name);
     }
 }
