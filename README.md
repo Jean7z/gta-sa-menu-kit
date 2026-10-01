@@ -13,9 +13,7 @@ y 2.00 armeabi-v7a (verificado contra `libGTASA.so` reales vía `nm -D`).
 - `AML_PSDK_MenuKit64` / `AML_PSDK_MenuKit` — cargador del framework.
   Resuelve `CTouchInterface::m_pWidgets`, `CWidgetButton::CWidgetButton(...)`
   y `CTouchInterface::IsReleased(...)` por símbolo, inyecta el widget en el pool
-  del juego y expone `GetMenuAPI()` (API v7).
-- `AML_PSDK_CarSpawner64` / `AML_PSDK_CarSpawner` — ejemplo de cliente: un botón
-  que spawnea una Sanchez (modelo 411) vía `CStreaming` por símbolo.
+  del juego y expone `GetMenuAPI()` (API v8).
 
 El framework usa el pool nativo del juego (190 slots). El widget inyectado
 participa de los loops nativos: el juego lo pinta, lo toca, y reporta el release
@@ -32,11 +30,11 @@ ejemplo al abrir/cerrar menús), migrando de slot si el juego lo ocupó.
 ## Instalar
 
 1. Copia `libAML_PSDK_MenuKit64.so` a `Android/data/com.rockstargames.gtasa/files/psdk/` (arm64).
-2. Copia `libAML_PSDK_CarSpawner64.so` a la misma carpeta.
+2. Copia `libAML_PSDK_InternetRadio64.so` a la misma carpeta.
 3. Lanza el juego (AML carga los mods en orden de letras: `AML_PSDK_*`).
 
 > El framework debe cargarse ANTES que los clientes (orden alfabético de la
-> carpeta psdk: `MenuKit` < `CarSpawner`). Los clientes usan `MenuKit_GetAPI()`
+> carpeta psdk: `MenuKit` < `InternetRadio`). Los clientes usan `MenuKit_GetAPI()`
 > que resuelve el framework en runtime y aborta limpio si no está.
 
 ## API v8 (`mod/menu-api.h`)
