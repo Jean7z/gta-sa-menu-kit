@@ -6,12 +6,17 @@
 extern "C" {
 #endif
 
-#define MENUKIT_API_VERSION 9
+#define MENUKIT_API_VERSION 10
 
 typedef void (*MenuKit_OnReleaseCallback)(void* userdata);
 typedef void (*MenuKit_TickCallback)(void* userdata);
 
-/* API v9 - resolved by symbol from AML_PSDK_MenuKit64.so / AML_PSDK_MenuKit.so
+/* API v10 - resolved by symbol from AML_PSDK_MenuKit64.so / AML_PSDK_MenuKit.so
+   v10 changes: DrawText appended at the END of the struct. The canvas could
+   draw shapes only, so a client could not put a word on screen without
+   spending a native button on it - the exact limitation the canvas exists to
+   remove. DrawText rasterises a string with the embedded 5x7 font and caches
+   it per (text, scale, colour), so a static label costs one quad per frame.
    v9 changes: GetPointer appended at the END of the struct. GetTap is a
    one-frame rising edge, so a client can see a tap but CANNOT follow a drag:
    a slider, a swipe or a long-press all need to know "is the finger still
@@ -216,6 +221,30 @@ typedef struct MenuKitAPI
        untouched, so a client can degrade to a tap-only UI instead of acting
        on garbage. */
     int (*GetPointer)(float* x, float* y, int* down);
+
+    /* v10: text on the canvas, with no widget and no label texture. Every other
+       draw call is shapes only, so a client could not put a word on screen
+       without a native button - which is exactly the constraint this replaces.
+
+       x/y is the top-left of the string in real pixels, same space as
+       GetRect/GetTap. scale is a glyph multiplier (1 = raw 5x7, clamped 1..16);
+       the advance is 6*scale per character and the height 8*scale, so a string
+       measures len*6*scale wide with no API call. rgba uses the same packing as
+       DrawRect: r in the low byte, a in the high byte.
+
+       Each distinct (text, scale, colour) is rasterised once into its own
+       texture and cached for the session, so a label redrawn every frame costs
+       one quad, not one upload. The texture is never destroyed by the framework
+       (same policy as the icon and label caches: they live until the game
+       closes), so the first frame of a new string is the only expensive one.
+
+       Draw order is call order, including relative to the shape batch: a rect
+       drawn before a label sits under it, one drawn after sits on top. The
+       glyphs are drawn on a transparent background, so whatever the client
+       painted behind them shows through.
+
+       Costs one texture per unique string, not one per call. */
+    void (*DrawText)(float x, float y, const char* text, int scale, uint32_t rgba);
 } MenuKitAPI;
 
 /* Framework entrypoint. The framework .so exports this; client mods resolve it. */
