@@ -1355,7 +1355,7 @@ static bool MenuKit_Init(IAML* aml)
     {
         aml->Hook((void*)aml->GetSym(pGameHandle, "_Z13Render2dStuffv"),
                   (void*)&HookOf_Render2dStuff, (void**)&Render2dStuff);
-        logger->Info("MenuKit: canvas ready (API v8)");
+        logger->Info("MenuKit: canvas ready (API v%d)", MENUKIT_API_VERSION);
     }
 
     /* self-check: pool pointer sane, slots reservable */
@@ -1768,8 +1768,11 @@ static void MenuKit_DrawText(float x, float y, const char* text, int scale, uint
     {
         stbi_uc* px = MenuKit_RasterizeText(text, scale, cr, cg, cb, ca);
         if(!px) return;
+        /* UploadRGBA takes ownership: it frees px on every path, success or
+           failure. Freeing it again here is a double free (scudo reports it as
+           "alignment too big", not "double free", because the chunk metadata is
+           already poisoned by the time of the second call). */
         void* tex = MenuKit_UploadRGBA(px, pw, ph, &ras);
-        stbi_image_free(px);
         if(!tex || !ras) return;
         IconEntry c;
         memset(&c, 0, sizeof(c));
