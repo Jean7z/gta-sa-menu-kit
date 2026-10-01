@@ -83,6 +83,149 @@ static void* (*s_pfnRwRasterGetPixels)(void*) = NULL;
 static void* (*s_pfnRwRasterLock)(void*, unsigned char, int) = NULL;
 static void  (*s_pfnRwRasterUnlock)(void*) = NULL;
 
+/* ---- v8: immediate-mode 2D canvas ---------------------------------------
+   The engine already exposes RenderWare's 2D immediate pipeline, which is all a
+   shape/alpha layer needs: per-vertex RGBA plus blend state. No ImGui, no DOM.
+
+   Clients do NOT call RenderWare. They push geometry from SetTick (which runs
+   in the CGame_Process pump); we accumulate it and flush the WHOLE frame as a
+   single indexed triangle list inside the Render2dStuff hook, where the engine
+   has actually set up the 2D raster. Two reasons for that split:
+     - CGame_Process is early in the frame; there is no valid 2D raster state
+       yet, so drawing from there would target whatever the last raster was.
+     - one RW call per frame instead of one per primitive, and a flush point
+       isolated in one function if the hook ever needs moving.
+
+   Coordinates are already REAL PIXELS, passed through untouched: the same space
+   as GetRect/GetTap, so canvas art and hit-testing never disagree.
+
+   The psdk RenderWare headers are NOT includable standalone (sdk_base.h demands
+   plugin.h first), and the framework resolves RenderWare by mangled symbol
+   anyway, so the two types and the enum values we need are declared here. They
+   mirror gta_base/DrawVertices.h and renderware/RwRender.h - keep in sync if
+   those ever change, or assert against them from a plugin.h translation unit. */
+struct RwIm2DVertex
+{
+    float x, y, z, rhw;          /* screen x/y/z, reciprocal homogeneous W */
+    unsigned char r, g, b, a;    /* vertex colour, byte order as stored */
+    float u, v;                  /* texture coords (unused: no texture) */
+};
+typedef unsigned short RwImVertexIndex;
+
+enum { RW_RS_TEXTURE_RASTER = 1, RW_RS_ZTEST_ENABLE = 6, RW_RS_ZWRITE_ENABLE = 8,
+       RW_RS_SRC_BLEND = 10, RW_RS_DST_BLEND = 11, RW_RS_VERTEX_ALPHA_ENABLE = 12 };
+enum { RW_BLEND_SRC_ALPHA = 5, RW_BLEND_INV_SRC_ALPHA = 6 };
+enum { RW_PRIMTYPE_TRI_LIST = 3 };
+
+#define CANVAS_MAX_VERTS  2048
+#define CANVAS_MAX_INDICES 3072
+
+static RwIm2DVertex   s_canvasVerts[CANVAS_MAX_VERTS];
+static RwImVertexIndex s_canvasIdx[CANVAS_MAX_INDICES];
+static int s_canvasNumVerts = 0;
+static int s_canvasNumIdx   = 0;
+static int s_canvasSrcBlend = RW_BLEND_SRC_ALPHA;
+static int s_canvasDstBlend = RW_BLEND_INV_SRC_ALPHA;
+static int s_canvasLostVerts = 0;   /* overflow accounting, logged once */
+
+static int   (*s_pfnRwRenderStateSet)(int, void*) = NULL;
+static int   (*s_pfnRwIm2DRenderIndexedPrimitive)(int, RwIm2DVertex*, int, RwImVertexIndex*, int) = NULL;
+
+/* Append one vertex in real pixels. Returns 0 when the batch is full, so the
+   draw call can bail instead of writing past the arrays. */
+static bool Canvas_Push(float x, float y, uint32_t rgba)
+{
+    if(s_canvasNumVerts >= CANVAS_MAX_VERTS) { s_canvasLostVerts++; return false; }
+    RwIm2DVertex* v = &s_canvasVerts[s_canvasNumVerts++];
+    v->x   = x;
+    v->y   = y;
+    v->z   = 0.0f;
+    v->rhw = 1.0f;
+    v->r   = (unsigned char)( rgba        & 0xFF);
+    v->g   = (unsigned char)((rgba >>  8) & 0xFF);
+    v->b   = (unsigned char)((rgba >> 16) & 0xFF);
+    v->a   = (unsigned char)((rgba >> 24) & 0xFF);
+    v->u = v->v = 0.0f;
+    return true;
+}
+
+/* Append one triangle. All-or-nothing: on overflow the vertices stay orphaned in
+   the batch but no index is emitted, so a dropped triangle can never reference
+   vertices belonging to the next shape. */
+static void Canvas_Tri(const float* xy, uint32_t rgba)
+{
+    if(s_canvasNumIdx + 3 > CANVAS_MAX_INDICES) { s_canvasLostVerts++; return; }
+    const RwImVertexIndex base = (RwImVertexIndex)s_canvasNumVerts;
+    if(!Canvas_Push(xy[0], xy[1], rgba)) return;
+    if(!Canvas_Push(xy[2], xy[3], rgba)) return;
+    if(!Canvas_Push(xy[4], xy[5], rgba)) return;
+    s_canvasIdx[s_canvasNumIdx++] = base;
+    s_canvasIdx[s_canvasNumIdx++] = (RwImVertexIndex)(base + 1);
+    s_canvasIdx[s_canvasNumIdx++] = (RwImVertexIndex)(base + 2);
+}
+
+/* Convex or star-shaped polygon as a triangle fan. Good enough for circles,
+   rounded shapes, arrows and rings; NOT for self-intersecting outlines. */
+static void Canvas_Fan(const float* xy, int count, uint32_t rgba)
+{
+    for(int i = 1; i < count - 1; ++i) {
+        const float t[6] = { xy[0], xy[1], xy[2*i], xy[2*i+1], xy[2*i+2], xy[2*i+3] };
+        Canvas_Tri(t, rgba);
+    }
+}
+
+/* Stroke a closed/open outline by fanning quads between each segment and the
+   next, so the stroke keeps a real thickness instead of relying on the raster's
+   fixed line width. */
+static void Canvas_Stroke(const float* xy, int count, uint32_t rgba, float width, bool closed)
+{
+    if(width <= 0.0f) return;
+    const int segs = closed ? count : count - 1;
+    for(int i = 0; i < segs; ++i) {
+        const int a = i * 2, b = ((i + 1) % count) * 2;
+        /* Offset perpendicular to the segment, half the width each way. */
+        const float dx = xy[b] - xy[a], dy = xy[b+1] - xy[a+1];
+        const float len = dx * dx + dy * dy;
+        if(len < 1e-6f) continue;
+        const float h = width * 0.5f;
+        const float nx = -dy * h / (float)sqrt(len), ny = dx * h / (float)sqrt(len);
+        const float q0[6] = { xy[a]+nx,   xy[a+1]+ny,   xy[a]-nx,   xy[a+1]-ny,   xy[b]-nx,   xy[b+1]-ny };
+        const float q1[6] = { xy[a]+nx,   xy[a+1]+ny,   xy[b]-nx,   xy[b+1]-ny,   xy[b]+nx,   xy[b+1]+ny };
+        Canvas_Tri(q0, rgba);
+        Canvas_Tri(q1, rgba);
+    }
+}
+
+/* Reset the batch. Called at the top of the frame, before the client tick, so
+   each frame's geometry stands alone and a client that stops drawing simply
+   stops drawing (rather than accumulating a permanent polygon pile). */
+static void Canvas_Clear(void)
+{
+    s_canvasNumVerts = 0;
+    s_canvasNumIdx   = 0;
+    if(s_canvasLostVerts) { logger->Info("MenuKit: canvas batch overflow, %d prim(s) dropped", s_canvasLostVerts); s_canvasLostVerts = 0; }
+}
+
+/* Flush the frame as one indexed triangle list. Called from the Render2dStuff
+   hook, i.e. after the engine has set up the 2D raster. */
+static void Canvas_Flush(void)
+{
+    if(s_canvasNumIdx < 3 || !s_pfnRwRenderStateSet || !s_pfnRwIm2DRenderIndexedPrimitive) return;
+
+    /* Untextured, vertex-coloured, alpha-blended, depth-agnostic. These are the
+       states a 2D overlay wants; the engine restores its own after the frame. */
+    s_pfnRwRenderStateSet(RW_RS_TEXTURE_RASTER,         NULL);
+    s_pfnRwRenderStateSet(RW_RS_ZTEST_ENABLE,           (void*)(intptr_t)0);
+    s_pfnRwRenderStateSet(RW_RS_ZWRITE_ENABLE,          (void*)(intptr_t)0);
+    s_pfnRwRenderStateSet(RW_RS_VERTEX_ALPHA_ENABLE,     (void*)(intptr_t)1);
+    s_pfnRwRenderStateSet(RW_RS_SRC_BLEND,             (void*)(intptr_t)s_canvasSrcBlend);
+    s_pfnRwRenderStateSet(RW_RS_DST_BLEND,            (void*)(intptr_t)s_canvasDstBlend);
+
+    s_pfnRwIm2DRenderIndexedPrimitive(RW_PRIMTYPE_TRI_LIST, s_canvasVerts,
+                                      s_canvasNumVerts, s_canvasIdx, s_canvasNumIdx);
+}
+
+
 /* Real screen size in pixels (OS_ScreenGetWidth/Height, resolved at init like
    MenuVSL does). Used to project the widget's VIRTUAL 640x448 position to
    real pixels for the label panel — the widget's own live rect (+0x2c..+0x38)
@@ -92,6 +235,25 @@ static int (*s_pfnOS_ScreenGetWidth)(void)  = NULL;
 static int (*s_pfnOS_ScreenGetHeight)(void) = NULL;
 static float s_screenW = 640.0f;   /* fallbacks until resolved */
 static float s_screenH = 448.0f;
+
+/* Global pointer state. AML exposes no touch/pad API, so "was that tap outside
+   my panel?" was unanswerable: a client could only react to touches that landed
+   on one of ITS OWN widgets, and a full-screen catcher widget would swallow the
+   game's joystick and fire button.
+
+   The state lives in static members of CTouchInterface, which is just a global
+   with a class name (the mangling ends in `E` for static data members):
+     m_bTouchDown  - a finger is on the glass
+     m_vecCachedPos - CVector2D, the position the game cached for that touch
+   Read directly, no CTouchInterface instance needed (GetTouchPosition(int) is a
+   non-static member, so it would need one; the statics need nothing). */
+static bool*  s_pTouchDown  = NULL;   /* CTouchInterface::m_bTouchDown */
+static float* s_pTouchPos   = NULL;   /* CTouchInterface::m_vecCachedPos, {x, y} */
+/* Latched by the pump so GetTap is a pure read; see the CGame_Process hook. */
+static bool   s_prevDown    = false;
+static int    s_tapThisFrame = 0;
+static float  s_tapX = 0.0f, s_tapY = 0.0f;
+static int    s_tapCount = 0;   /* DEBUG: counts rising edges to expose a bouncing signal */
 
 /* Icon cache: same path -> same RwTexture (shared across buttons). Created
    once and NEVER destroyed by the mod: we write sprite[0] (+0x10) directly and
@@ -138,9 +300,18 @@ struct WidgetEntry
     void*       iconTex;      /* cached custom RwTexture from MenuKit_LoadIcon; NULL = none/failed */
     char        text[128];    /* Plan B label: rendered by SetText into a texture ("" = no label) */
     void*       textTex;      /* cached label texture from MenuKit_RenderTextTexture */
+    uint8_t     alpha;        /* 0..255 written at build; 0xFF = opaque (SetAlpha) */
+    uint8_t     visible;      /* 0 = parked (not drawn, not touchable); SetVisible */
+    int         hasSize;      /* 1 = sizeW/sizeH owned by us, not the engine's square */
+    float       sizeW, sizeH; /* size in REAL pixels, applied around the engine's centre; SetSize */
     WidgetPosition pos;
 };
 static WidgetEntry s_widgets[OUR_WIDGET_LIMIT];
+
+/* Client per-frame callback (SetTick). AML exposes no per-frame hook, so this
+   pump is the only place a client can run a timer (auto-hide, toast). */
+static MenuKit_TickCallback s_tick = NULL;
+static void* s_tickUser = NULL;
 
 /* Menu stack (push/pop). Only the ACTIVE menu's widgets ever occupy pool
    slots; switching menus destroys the outgoing group so the game can reuse
@@ -635,10 +806,15 @@ static void MenuKit_BuildWidget(WidgetEntry& e)
          any widget whose flags lack bit 0x4, pinning +0x59=0 (ManageAlpha fade-out);
        - CWidgetButton::Draw early-returns while +0x58==0.
        So: flag 0x4 = touch-immune (skips the auto-disable), +0x59=1 fade-in,
-       +0x58=0xFF alpha instantly visible. */
+       +0x58=alpha (SetAlpha; 0xFF = the old hardcoded instant-visible).
+       A widget parked with SetVisible(0) is the INVERSE of all three — no 0x4,
+       +0x59=0, +0x58=0 — which is the game's own idle-button state: not drawn
+       and, because the engine re-applies SetEnabled(w,0) every frame to anything
+       without 0x4, not touchable either. */
     *(uint32_t*)((uintptr_t)mem + 0x8c) |= 0x04;
-    *(uint8_t*)((uintptr_t)mem + 0x59) = 0x01;
-    *(uint8_t*)((uintptr_t)mem + 0x58) = 0xFF;
+    if(!e.visible) *(uint32_t*)((uintptr_t)mem + 0x8c) &= ~0x04u;
+    *(uint8_t*)((uintptr_t)mem + 0x59) = e.visible ? 0x01 : 0x00;
+    *(uint8_t*)((uintptr_t)mem + 0x58) = e.visible ? e.alpha : 0x00;
     /* Custom icon: swap sprite[0] (+0x10) post-ctor. The ctor resolved
        e.texture from the game's DB so the sprite exists; Draw reads sprite[0]
        directly (CWidgetButton::Draw @0x373698) — writing the pointer is all it
@@ -684,19 +860,48 @@ static int MenuKit_CurrentMenu(void)
     return s_menuDepth > 0 ? s_menuStack[s_menuDepth - 1] : 0;
 }
 
+/* Free one of OUR widgets the same way the game does it.
+
+   Native reference (libGTASA.so):
+     - CTouchInterface::DeleteAll @0x36ed44 and DeleteWidget @0x371aa0 both do
+       the SAME three steps on a pool slot: load m_pWidgets[slot]; if non-NULL,
+       call the object's virtual destructor at [vtable+0x8]; store NULL back.
+     - CTouchInterface::CreateShopWidget @0x3719fc frees the widget previously
+       in its slot exactly that way BEFORE operator new'ing the replacement.
+
+   So the game owns the per-widget free, and the canonical recipe is exactly
+   "virtual dtor + NULL". We reproduce it here instead of calling DeleteWidget
+   (which is a non-static method needing a CTouchInterface* we don't hold).
+
+   Safe against double-free: callers verify s_pWidgetsPool[slot]==e->widget
+   first, so we only destroy the object that is CURRENTLY in that slot; if the
+   game already reclaimed it, the pointer differs (or the slot is NULL) and we
+   leave it alone. This mirrors the game's own habit of checking the slot. */
+static void MenuKit_FreeWidgetSlot(void* widget, int slot)
+{
+    if(!widget || !s_pWidgetsPool) return;
+    if(slot < 0 || slot >= MAX_POOL_SLOTS) return;
+    if(s_pWidgetsPool[slot] != widget) return;   /* not ours anymore */
+    /* Virtual destructor: first two vtable slots are the deleting/complete
+       object dtors; the game calls [vtable+0x8] (the complete-object dtor). */
+    void** vtable = *(void***)widget;
+    if(vtable && vtable[1])
+        ((void(*)(void*))vtable[1])(widget);
+    s_pWidgetsPool[slot] = NULL;
+}
+
 /* Free a menu's pool widgets so the game can reuse the slots (pool is
-   ~172/190 used with menus open). The CWidgetButton objects themselves are NOT
-   freed (double-free risk — the game has no per-widget free we can trust);
-   the leak is bounded by OUR_WIDGET_LIMIT. Entries keep their definition;
-   the pump rebuilds the group at topmost free when it becomes active again. */
+   ~172/190 used with menus open). Each widget object is destroyed via its
+   virtual destructor, exactly as CTouchInterface::DeleteWidget does, so the
+   slots are genuinely released instead of leaked. Entries keep their
+   definition; the pump rebuilds the group at topmost free when active again. */
 static void MenuKit_DestroyGroup(int menu)
 {
     for(int i = 0; i < OUR_WIDGET_LIMIT; ++i)
     {
         WidgetEntry& e = s_widgets[i];
         if(!e.active || e.menu != menu) continue;
-        if(e.widget && e.slot >= 0 && e.slot < MAX_POOL_SLOTS && s_pWidgetsPool[e.slot] == e.widget)
-            s_pWidgetsPool[e.slot] = NULL;
+        MenuKit_FreeWidgetSlot(e.widget, e.slot);
         e.widget = NULL;
         e.slot = -1;
     }
@@ -717,9 +922,127 @@ static int MenuKit_FreeSlots(void)
     return n;
 }
 
+/* Push the DESIRED state of a widget onto the live object: custom rect
+   (+0x2c..+0x38), alpha (+0x58), fade (+0x59) and the touch-immune bit in
+   flags (+0x8c). Called from the setters for immediate effect AND from the
+   pump on EVERY frame.
+
+   Why every frame: the engine's own widget update runs INSIDE CGame_Process
+   and restores alpha/fade/flags, so a one-shot write from a setter loses
+   within a frame — measured, SetAlpha(128) read back as 255. Because the pump
+   runs after orig, re-asserting here wins, and that single fact is what makes
+   a dim trigger and a hide that survives playable at all. */
+static void MenuKit_ApplyState(WidgetEntry* e)
+{
+    if(!e->widget) return;
+    if(e->hasSize)
+    {
+        /* Resize around the CENTRE the engine already computed, not around a
+           coordinate we guessed: the engine's own virtual-unit placement is
+           correct and device-independent, so reusing its centre keeps the
+           anchoring working while decoupling width from height. Reading and
+           rewriting the same four floats is idempotent, so re-asserting every
+           frame converges instead of drifting. */
+        float* r = (float*)((uintptr_t)e->widget + 0x2c);
+        /* 1e6 sentinel: the engine has not laid this widget out yet, so its rect
+           is not a position and centring on it would write a rect around 2e6.
+           Skip ONLY the resize - alpha/fade/flags below are independent of the
+           rect and must still land, or a not-yet-laid-out widget would keep the
+           visible state the engine gave it. */
+        if(r[0] <= 1e5f && r[1] <= 1e5f)
+        {
+            float cx = (r[0] + r[2]) * 0.5f;
+            float cy = (r[1] + r[3]) * 0.5f;
+            /* The engine's rect is bottom-up: r[1]=BOTTOM, r[3]=TOP. Rewrite in
+               the SAME order so the centre is preserved and the vertical
+               orientation matches the engine's own layout (writing min first
+               here would flip the widget top/bottom every frame). */
+            r[0] = cx - e->sizeW * 0.5f;
+            r[1] = cy + e->sizeH * 0.5f;   /* bottom */
+            r[2] = cx + e->sizeW * 0.5f;
+            r[3] = cy - e->sizeH * 0.5f;   /* top */
+        }
+    }
+    uint8_t*  pAlpha = (uint8_t*)((uintptr_t)e->widget + 0x58);
+    uint8_t*  pFade  = (uint8_t*)((uintptr_t)e->widget + 0x59);
+    uint32_t* pFlags = (uint32_t*)((uintptr_t)e->widget + 0x8c);
+    if(e->visible)
+    {
+        if(*pAlpha != e->alpha) *pAlpha = e->alpha;
+        if(*pFade != 1)          *pFade  = 1;
+        if((*pFlags & 0x04u) == 0) *pFlags |= 0x04u;
+    }
+    else
+    {
+        if(*pAlpha != 0) *pAlpha = 0;
+        if(*pFade != 0)  *pFade  = 0;
+        /* No 0x04: CTouchInterface re-applies SetEnabled(w,0) and the widget
+           stops eating taps as well as stop drawing. */
+        if((*pFlags & 0x04u) != 0) *pFlags &= ~0x04u;
+    }
+}
+
+/* v8 canvas flush.
+
+   One indexed triangle list, submitted from the game's 2D pass. Render2dStuff is
+   where the raster, camera and blend states an overlay needs are already set up.
+
+   Z-order, measured on device rather than assumed: flushing after the pass put
+   AML widget panels *under* client art, and moving the flush earlier - to the
+   head of the pass, or to CTouchInterface::DrawAll inside it - changed nothing.
+   Both still landed on top. So AML renders its own UI somewhere earlier in the
+   frame, outside the game's 2D pass entirely, and this hook is the cheapest
+   point that has a live raster.
+
+   The first two attempts crashed the process and are deliberately not repeated:
+   the raster is not mounted before the pass runs, so there is nowhere valid to
+   draw from there.
+
+   Consequence for clients: canvas art covers AML widgets in overlapping space.
+   Draw a whole panel with the canvas rather than mixing the two. */
+DECL_HOOKv(Render2dStuff, void)
+{
+    Render2dStuff(); /* orig */
+    Canvas_Flush();
+}
+
 DECL_HOOKv(CGame_Process, void)
 {
     CGame_Process(); /* orig */
+
+    /* Latch the pointer BEFORE the client tick, so a client calling GetTap from
+       its tick sees the tap that started this frame instead of the one that
+       ended it. Rising edge (was up, now down) = one new tap. Falling edge only
+       refreshes s_prevDown, so holding a finger is one tap, not 60. */
+    if(s_pTouchDown && s_pTouchPos)
+    {
+        bool down = *s_pTouchDown;
+        if(down && !s_prevDown)
+        {
+            s_tapX = s_pTouchPos[0];
+            s_tapY = s_pTouchPos[1];
+            s_tapThisFrame = 1;
+            /* One-shot proof the pointer globals work and the units are sane.
+               Bounded at a few so a real play session cannot spam the log. */
+            if(s_tapCount < 3)
+            {
+                s_tapCount++;
+                logger->Info("MenuKit: TAP#%d at (%g,%g) real px", s_tapCount, s_tapX, s_tapY);
+            }
+        }
+        s_prevDown = down;
+    }
+
+    /* Client timer tick. BEFORE the pool check: a client counting down an
+       auto-hide should not lose frames just because the pool is late, and
+       Add/Remove are deferred so they are safe either way.
+
+       Canvas_Clear runs first so the tick rebuilds this frame's geometry from
+       scratch: the batch is per-frame, not a persistent scene graph. */
+    Canvas_Clear();
+    if(s_tick) s_tick(s_tickUser);
+
+    s_tapThisFrame = 0;   /* one-frame lifetime, consumed by whoever reads it */
 
     if(!s_pWidgetsPool) return;
     for(int i = 0; i < OUR_WIDGET_LIMIT; ++i)
@@ -761,6 +1084,8 @@ DECL_HOOKv(CGame_Process, void)
             }
         }
 
+        /* Our state wins this frame: rect, alpha, fade, flags. Must come after
+           the (re)build above, since a fresh widget needs the rect applied. */
         /* Re-protect the custom icon: two distinct steals — (1) the game
            overwrites sprite[0] when it rebuilds pool widgets (menu open/close,
            entering a vehicle, pausing...); (2) the game's streaming can recycle
@@ -827,80 +1152,15 @@ DECL_HOOKv(CGame_Process, void)
         bool touched = s_pfnIsTouched(e.slot, NULL, 1);
         if(e.wasTouched && !touched && e.onRelease) e.onRelease(e.userdata);
         e.wasTouched = touched;
+
+        /* Our state wins the frame: rect, alpha, fade, flags. LAST on purpose.
+           IsTouched above is a real game call that runs the widget's own
+           per-frame update, which reset fade to 1 right after an earlier
+           placement of this call had set it to 0 - measured. Written after it,
+           the desired state survives to the draw. */
+        MenuKit_ApplyState(&e);
     }
 
-    /* DEBUG: full-pool dump. Every ~300 ticks (5s) AND on structural change
-       (pool content hash), capped at 150 dumps (~12min window). Catches the
-       vehicle-mode layout: entering a car rebuilds the pool around the game's
-       vehicle buttons (the native attack button sits at slot 187, so vehicle
-       widgets are NOT all low). Verifies our widget stays in the topmost free
-       slot and reveals which slots the game's vehicle buttons use. */
-    static int s_dbgTick = 0;
-    static uint64_t s_dbgHash = 0;
-    static int s_dbgDumps = 0;
-    ++s_dbgTick;
-    uint64_t hash = 0;
-    for(int s = 0; s < MAX_POOL_SLOTS; ++s)
-        hash ^= (uint64_t)(uintptr_t)s_pWidgetsPool[s] * (uint64_t)(s + 1);
-    bool changed = s_dbgTick > 90 && hash != s_dbgHash;
-    if(((s_dbgTick % 300) == 0 || changed) && s_dbgDumps < 150)
-    {
-        s_dbgHash = hash;
-        ++s_dbgDumps;
-        int used = 0;
-        /* Raster-header diff: ours (MenuKitIcon) vs the FIRST non-ours textured
-           widget (a game-native texture like shoot, rendered by the SAME
-           CWidgetButton::Draw). Both rasters flow through CSprite2d::Draw's
-           texture bind — any flag/format/type difference is the corruption
-           suspect. RwTexture.raster is its FIRST member (*spr); this fork's
-           raster header is GL-backed: dims u32 @+0x18/+0x1c, flags/type packed
-           in the low header dwords (our creation diag showed of=0x604: low
-           nibble 4 = rwRASTERTYPECAMERATEXTURE vs Txd textures' TEXTURE type). */
-        int firstForeign = -1;
-        void* ourSprSlot = NULL;
-        for(int s = 0; s < MAX_POOL_SLOTS; ++s)
-        {
-            void* w = s_pWidgetsPool[s];
-            if(!w) continue;
-            ++used;
-            uintptr_t p = (uintptr_t)w;
-            uint32_t flags = *(uint32_t*)(p + 0x8c);
-            uint32_t hid   = *(uint32_t*)(p + 0x08);
-            uint8_t  alpha = *(uint8_t*)(p + 0x58);
-            uint8_t  fade  = *(uint8_t*)(p + 0x59);
-            void*    spr   = *(void**)(p + 0x10);
-            const char* tnm = spr ? (const char*)((uintptr_t)spr + 0x20) : ""; /* RwTexture name inline @+0x20 */
-            float l = *(float*)(p + 0x2c), t = *(float*)(p + 0x30);
-            float r = *(float*)(p + 0x34), b = *(float*)(p + 0x38);
-            bool ours = false;
-            for(int i = 0; i < OUR_WIDGET_LIMIT; ++i)
-                if(s_widgets[i].active && s_widgets[i].widget == w) { ours = true; break; }
-            if(spr && ours && !ourSprSlot) ourSprSlot = spr;
-            if(spr && !ours && firstForeign < 0) firstForeign = s;
-            logger->Info("MenuKit: DBG slot=%d vtb=%p spr=%p tnm=%.24s hid=%u flg=0x%X al=%u fade=%u rect=(%g,%g,%g,%g)%s",
-                s, *(void**)p, spr, tnm, hid, flags, alpha, fade, l, t, r, b, ours ? " <<< OURS" : "");
-        }
-        logger->Info("MenuKit: DBG pool=%d/%d used%s", used, MAX_POOL_SLOTS, changed ? " (changed)" : "");
-        if(ourSprSlot || firstForeign >= 0)
-        {
-            void* foreignSpr = firstForeign >= 0 ? *(void**)((uintptr_t)s_pWidgetsPool[firstForeign] + 0x10) : NULL;
-            for(int pass = 0; pass < 2; ++pass)
-            {
-                void* spr = pass == 0 ? ourSprSlot : (firstForeign >= 0 && pass == 1 ? foreignSpr : NULL);
-                if(!spr) continue;
-                void* ras = *(void**)spr;
-                const char* tag = pass == 0 ? "OURS" : "GAME";
-                char qws[360] = {0}; int qp = 0;
-                const unsigned char* rb = (const unsigned char*)ras;
-                for(int i = 0; i < 0x38 && qp < 340; i += 8)
-                    qp += snprintf(qws + qp, sizeof(qws) - qp, "[%02x]=%p ", i, *(const void**)(rb + i));
-                logger->Info("MenuKit: RASTERDIFF %s slot=%d tex=%p ras=%p w=%u h=%u %s",
-                             tag, pass == 0 ? -1 : firstForeign, spr, ras,
-                             rb ? *(const uint32_t*)(rb + 0x18) : 0,
-                             rb ? *(const uint32_t*)(rb + 0x1c) : 0, qws);
-            }
-}
-     }
 }
 
 static bool MenuKit_Init(IAML* aml)
@@ -913,6 +1173,17 @@ static bool MenuKit_Init(IAML* aml)
     s_pfnCtorButton   = (void*)aml->GetSym(pGameHandle, "_ZN13CWidgetButtonC2EPKcRK14WidgetPositionjj10HIDMapping");
     s_pfnIsReleased   = (bool(*)(int,void*,int))aml->GetSym(pGameHandle, "_ZN15CTouchInterface10IsReleasedENS_9WidgetIDsEP9CVector2Di");
     s_pfnIsTouched    = (bool(*)(int,void*,int))aml->GetSym(pGameHandle, "_ZN15CTouchInterface9IsTouchedENS_9WidgetIDsEP9CVector2Di");
+
+    /* Global pointer state. Static data members, so GetSym hands back the
+       ADDRESS of the member: bool* and float* {x,y} respectively, not a copy. */
+    s_pTouchDown = (bool*)aml->GetSym(pGameHandle, "_ZN15CTouchInterface12m_bTouchDownE");
+    s_pTouchPos  = (float*)aml->GetSym(pGameHandle, "_ZN15CTouchInterface14m_vecCachedPosE");
+    if(s_pTouchDown && s_pTouchPos)
+        logger->Info("MenuKit: global pointer state resolved (m_bTouchDown=%p m_vecCachedPos=%p)",
+                     s_pTouchDown, s_pTouchPos);
+    else
+        logger->Error("MenuKit: global pointer state NOT resolved (down=%p pos=%p) - "
+                      "'tap outside' will not work, everything else will", s_pTouchDown, s_pTouchPos);
 
     /* RenderWare symbol resolution for custom icons (non-fatal if missing). */
     s_pfnRwImageCreate           = (void*(*)(int,int,int))aml->GetSym(pGameHandle, "_Z13RwImageCreateiii");
@@ -979,6 +1250,28 @@ static bool MenuKit_Init(IAML* aml)
     aml->Hook((void*)aml->GetSym(pGameHandle, "_ZN5CGame7ProcessEv"),
               (void*)&HookOf_CGame_Process, (void**)&CGame_Process);
 
+    /* v8 canvas: the 2D immediate pipeline. Optional - if it is missing the
+       draw calls become no-ops and the retained widget API still works, so a
+       mismatch degrades instead of breaking every client. */
+    s_pfnRwRenderStateSet = (int(*)(int, void*))aml->GetSym(pGameHandle,
+        "_Z16RwRenderStateSet13RwRenderStatePv");
+    s_pfnRwIm2DRenderIndexedPrimitive = (int(*)(int, RwIm2DVertex*, int, RwImVertexIndex*, int))
+        aml->GetSym(pGameHandle,
+        "_Z28RwIm2DRenderIndexedPrimitive15RwPrimitiveTypeP14RwOpenGLVertexiPti");
+
+    if(!s_pfnRwRenderStateSet || !s_pfnRwIm2DRenderIndexedPrimitive)
+    {
+        s_pfnRwRenderStateSet = NULL;
+        s_pfnRwIm2DRenderIndexedPrimitive = NULL;
+        logger->Error("MenuKit: Rw 2D symbols missing - canvas disabled (API v8 draw calls will no-op)");
+    }
+    else
+    {
+        aml->Hook((void*)aml->GetSym(pGameHandle, "_Z13Render2dStuffv"),
+                  (void*)&HookOf_Render2dStuff, (void**)&Render2dStuff);
+        logger->Info("MenuKit: canvas ready (API v8)");
+    }
+
     /* self-check: pool pointer sane, slots reservable */
     int freeSlots = 0;
     for(int s = 0; s < MAX_POOL_SLOTS; ++s) if(s_pWidgetsPool[s] == NULL) ++freeSlots;
@@ -1013,6 +1306,9 @@ static void* MenuKit_AddButton(int menu, const char* texture, float x, float y, 
     e->wasTouched = false;
     e->slot = -1;
     e->widget = NULL;  /* built lazily on the first CGame_Process frame */
+    e->alpha = 0xFF;   /* opaque unless SetAlpha says otherwise before the build */
+    e->visible = 1;    /* shown unless SetVisible parks it before the build */
+    e->hasSize = 0;    /* engine keeps its square size until SetSize is called */
     e->onRelease = onRelease;
     e->userdata = userdata;
     memset(e->icon, 0, sizeof(e->icon));
@@ -1027,8 +1323,10 @@ static void MenuKit_RemoveWidget(void* handle)
 {
     if(!handle || !s_pWidgetsPool) return;
     WidgetEntry* e = (WidgetEntry*)handle;
-    if(e->widget && e->slot >= 0 && e->slot < MAX_POOL_SLOTS && s_pWidgetsPool[e->slot] == e->widget)
-        s_pWidgetsPool[e->slot] = NULL; /* leave the object; pump may reclaim the slot */
+    /* Destroy the object like the game would (virtual dtor + NULL slot), then
+       clear the entry. Safe: FreeWidgetSlot re-checks the slot holds OUR widget
+       before destroying, so a game-reclaimed slot is never double-freed. */
+    MenuKit_FreeWidgetSlot(e->widget, e->slot);
     *e = WidgetEntry{};
     logger->Info("MenuKit: widget removed");
 }
@@ -1096,6 +1394,227 @@ static void MenuKit_SetText(void* handle, const char* text)
     logger->Info("MenuKit: widget '%s' text set to '%s'", e->texture, e->text[0] ? e->text : "(none)");
 }
 
+/* v5: register the client's per-frame callback (NULL clears it). Invoked from
+   the CGame_Process pump, so it runs once per rendered frame. */
+static void MenuKit_SetTick(MenuKit_TickCallback onTick, void* userdata)
+{
+    s_tick = onTick;
+    s_tickUser = userdata;
+    logger->Info("MenuKit: client tick %s", onTick ? "registered" : "cleared");
+}
+
+/* v5: alpha 0..255. Applied at build (replacing the old hardcoded 0xFF) AND,
+   when the widget is already live, written straight into its alpha byte so a
+   dim/bright toggle needs no remove+rebuild — which matters because the client
+   never frees widget objects itself, so every rebuild would leak one. */
+static void MenuKit_SetAlpha(void* handle, unsigned char alpha)
+{
+    if(!handle) return;
+    WidgetEntry* e = (WidgetEntry*)handle;
+    e->alpha = alpha;
+    MenuKit_ApplyState(e);   /* pump re-asserts it every frame, see ApplyState */
+    logger->Info("MenuKit: widget '%s' alpha set to %u%s", e->texture, (unsigned)alpha,
+                 e->widget ? "" : " (pending build)");
+}
+
+/* v5: show/hide. Hiding clears the touch-immune flag and zeroes the alpha, so
+   CTouchInterface re-applies SetEnabled(w,0) every frame and the widget stops
+   eating taps as well as stop drawing. */
+static void MenuKit_SetVisible(void* handle, int visible)
+{
+    if(!handle) return;
+    WidgetEntry* e = (WidgetEntry*)handle;
+    int on = visible != 0;
+    e->visible = (uint8_t)on;
+    MenuKit_ApplyState(e);   /* pump re-asserts it every frame, see ApplyState */
+    logger->Info("MenuKit: widget '%s' %s", e->texture, on ? "shown" : "parked");
+}
+
+/* v6: resize a widget in REAL pixels, keeping the centre the engine computed.
+
+   This is what breaks the "everything is a square" limit. The engine derives
+   both axes from ONE uniform `scale` (one number for width and height), so
+   every widget AddButton builds is square. The four floats the engine already
+   keeps in the object (+0x2c..+0x38) are just as writable, so decoupling them
+   lets a client express panels, bars and banners.
+
+   Deliberately SIZE-ONLY, not x/y/w/h. An earlier absolute-rect version needed
+   the true screen size, and OS_ScreenGetWidth() is not that: it reported
+   1024x600 while the real render is 1600x720, so absolute coordinates landed
+   the widget in the middle of the screen. Resizing around the engine's own
+   centre sidesteps the question entirely - the virtual-unit placement the
+   engine already does is correct and device-independent, so the anchor keeps
+   working and only the shape changes.
+
+   Re-asserted every frame by the pump (see MenuKit_ApplyState), so the engine
+   cannot take the size back. */
+static void MenuKit_SetSize(void* handle, float w, float h)
+{
+    if(!handle) return;
+    WidgetEntry* e = (WidgetEntry*)handle;
+    if(w <= 0.0f || h <= 0.0f)
+    {
+        logger->Info("MenuKit: SetSize('%s') ignored, bad size %gx%g", e->texture, w, h);
+        return;
+    }
+    e->hasSize = 1;
+    e->sizeW = w;
+    e->sizeH = h;
+    MenuKit_ApplyState(e);
+    logger->Info("MenuKit: widget '%s' size set to %gx%g real px%s",
+                 e->texture, w, h, e->widget ? "" : " (pending build)");
+}
+
+/* v7: where the player tapped, anywhere on screen.
+
+   AML has no touch/pad API, so a client could only ever react to touches landing
+   on one of its OWN widgets - and the usual workaround, a full-screen catcher
+   widget, silently eats the game's joystick and fire button. Reading the game's
+   own pointer globals removes the limitation instead of working around it.
+
+   Returns 1 on the frame a NEW tap begins (rising edge) and writes the position
+   in the same real-pixel space as GetRect, so a client hit-tests with two
+   numbers and no coordinate conversion. Holding a finger is one tap, not one
+   per frame. Returns 0 if the pointer globals were not resolved, or if the tap
+   was not this frame. */
+static int MenuKit_GetTap(float* x, float* y)
+{
+    if(!s_tapThisFrame) return 0;
+    if(x) *x = s_tapX;
+    if(y) *y = s_tapY;
+    return 1;
+}
+
+/* v7: live on-screen rect of a widget in real pixels (l, t, r, b). The engine
+   already keeps these four floats in every widget object, and a client needs
+   them for hit-testing, anchoring and tooltips. Pairs with GetTap: both are in
+   the same space, so `tap inside panel` is a four-comparison test with no
+   knowledge of the engine's virtual 640x448 projection.
+
+   Returns 0 for an unknown or not-yet-built handle, or if the engine has not
+   activated the widget yet (its rect is a 1e6 sentinel until then, observed in
+   the pool dump) - so a false 0 means "ask again next frame", never a garbage
+   rect. */
+static int MenuKit_GetRect(void* handle, float* l, float* t, float* r, float* b)
+{
+    if(!handle) return 0;
+    WidgetEntry* e = (WidgetEntry*)handle;
+    if(!e->widget) return 0;
+    const float* q = (const float*)((uintptr_t)e->widget + 0x2c);
+    /* 1e6 sentinel: the engine has not laid this widget out yet. */
+    if(q[0] > 1e5f || q[1] > 1e5f) return 0;
+    /* The engine stores the rect bottom-up: q = (left, BOTTOM, right, TOP), so
+       q[1] > q[3] for a real on-screen rect (verified in the pool dump, e.g.
+       (1461.5, 701.9, 1563.5, 599.9)). Export it TOP-DOWN (top < bottom) so a
+       client's `y >= top && y <= bottom` hit-test is satisfiable. Without this
+       swap the test is impossible (top > bottom) and every tap reads as
+       "outside" -> the panel closed on every touch. */
+    float top = q[3], bot = q[1];
+    if(top > bot) { float tmp = top; top = bot; bot = tmp; }
+    if(l) *l = q[0];
+    if(t) *t = top;
+    if(r) *r = q[2];
+    if(b) *b = bot;
+    return 1;
+}
+
+/* ---------------------------------------------------------------------------
+   v8: immediate-mode 2D canvas. Real pixels, same space as GetRect/GetTap.
+   Call these from SetTick; the frame's geometry is flushed as one batch by the
+   Render2dStuff hook. Not thread-safe and not persistent - redraw every frame.
+   ------------------------------------------------------------------------ */
+
+/* rgba is 0xRRGGBBAA so a client can shift/ease a channel without bit-fiddling.
+   These return void: drawing is fire-and-forget, and a full batch degrades to
+   dropping primitives (counted and logged) rather than failing the client. */
+static void MenuKit_DrawRect(float x, float y, float w, float h, uint32_t rgba, int filled)
+{
+    if(w <= 0.0f || h <= 0.0f) return;
+    float xy[8] = { x, y,  x+w, y,  x+w, y+h,  x, y+h };
+    if(filled) { float q[6] = { x, y, x+w, y, x+w, y+h }; Canvas_Tri(q, rgba);
+                 float r[6] = { x, y, x+w, y+h, x, y+h }; Canvas_Tri(r, rgba); }
+    else       { Canvas_Stroke(xy, 4, rgba, 1.0f, true); }
+}
+
+static void MenuKit_DrawQuad(float x1, float y1, float x2, float y2, float x3, float y3,
+                             float x4, float y4, uint32_t rgba, int filled)
+{
+    if(filled) {
+        const float a[6] = { x1, y1, x2, y2, x3, y3 };
+        const float b[6] = { x1, y1, x3, y3, x4, y4 };
+        Canvas_Tri(a, rgba);
+        Canvas_Tri(b, rgba);
+    } else {
+        const float xy[8] = { x1, y1, x2, y2, x3, y3, x4, y4 };
+        Canvas_Stroke(xy, 4, rgba, 1.0f, true);
+    }
+}
+
+static void MenuKit_DrawTriangle(float x1, float y1, float x2, float y2, float x3, float y3,
+                                 uint32_t rgba, int filled)
+{
+    if(filled) { const float t[6] = { x1, y1, x2, y2, x3, y3 }; Canvas_Tri(t, rgba); }
+    else {
+        const float xy[6] = { x1, y1, x2, y2, x3, y3 };
+        Canvas_Stroke(xy, 3, rgba, 1.0f, true);
+    }
+}
+
+static void MenuKit_DrawLine(float x1, float y1, float x2, float y2, uint32_t rgba, float width)
+{
+    if(width <= 0.0f) return;
+    /* Una linea SIEMPRE se rasteriza como un quad (2 triangulos, 6 indices).
+       Existia un atajo de 2 indices sueltos que estaba roto: el lote se dibuja
+       como RW_PRIMTYPE_TRI_LIST, que consume de 3 en 3, de modo que un par
+       suelto desalineaba todas las primitivas siguientes y una linea al final
+       del lote se comia indices de mas. Todo emisor del batch debe emitir
+       multiplos de 3. */
+    if(width < 1.0f) width = 1.0f;   /* el raster no hace sub-pixel */
+    const float dx = x2 - x1, dy = y2 - y1;
+    const float len = dx * dx + dy * dy;
+    if(len < 1e-6f) return;
+    const float nx = -dy * width * 0.5f / (float)sqrt(len);
+    const float ny =  dx * width * 0.5f / (float)sqrt(len);
+    const float a[6] = { x1+nx, y1+ny, x1-nx, y1-ny, x2-nx, y2-ny };
+    const float b[6] = { x1+nx, y1+ny, x2-nx, y2-ny, x2+nx, y2+ny };
+    Canvas_Tri(a, rgba);
+    Canvas_Tri(b, rgba);
+}
+
+static void MenuKit_DrawPoly(const float* xy, int count, uint32_t rgba, int filled, int closed)
+{
+    if(!xy || count < 3) return;
+    if(filled) Canvas_Fan(xy, count, rgba);
+    else       Canvas_Stroke(xy, count, rgba, 1.0f, closed != 0);
+}
+
+static void MenuKit_DrawCircle(float cx, float cy, float r, uint32_t rgba, int filled, int segments)
+{
+    if(r <= 0.0f) return;
+    if(segments < 3) segments = 3;
+    if(segments > 128) segments = 128;   /* matches the canvas batch budget */
+    float xy[129 * 2];
+    for(int i = 0; i < segments; ++i) {
+        const float a = (float)(i * 2.0 * 3.14159265358979323846 / segments);
+        xy[i * 2]     = cx + r * (float)cos(a);
+        xy[i * 2 + 1] = cy + r * (float)sin(a);
+    }
+    if(filled) Canvas_Fan(xy, segments, rgba);
+    else       Canvas_Stroke(xy, segments, rgba, 1.0f, true);
+}
+
+static void MenuKit_SetDrawBlend(int src, int dst)
+{
+    s_canvasSrcBlend = (src < 0) ? RW_BLEND_SRC_ALPHA : src;
+    s_canvasDstBlend = (dst < 0) ? RW_BLEND_INV_SRC_ALPHA : dst;
+}
+
+static void MenuKit_ResetDrawState(void)
+{
+    s_canvasSrcBlend = RW_BLEND_SRC_ALPHA;
+    s_canvasDstBlend = RW_BLEND_INV_SRC_ALPHA;
+}
+
 static MenuKitAPI g_api = {
     MENUKIT_API_VERSION,
     MenuKit_AddButton,
@@ -1103,10 +1622,50 @@ static MenuKitAPI g_api = {
     MenuKit_IsReleased,
     MenuKit_OpenMenu,
     MenuKit_CloseMenu,
-    MenuKit_SetText
+    MenuKit_SetText,
+    MenuKit_SetTick,
+    MenuKit_SetAlpha,
+    MenuKit_SetVisible,
+    MenuKit_SetSize,
+    MenuKit_GetTap,
+    MenuKit_GetRect,
+    MenuKit_DrawRect,
+    MenuKit_DrawQuad,
+    MenuKit_DrawTriangle,
+    MenuKit_DrawLine,
+    MenuKit_DrawPoly,
+    MenuKit_DrawCircle,
+    MenuKit_SetDrawBlend,
+    MenuKit_ResetDrawState
 };
 
 const MenuKitAPI* GetMenuAPI(void) { return &g_api; }
+
+/* Dispose every widget this framework still owns, then drop all state. Called
+   from the host mod's ON_MOD_UNLOAD via the framework main.cpp. Each live
+   object is destroyed through its virtual destructor (the game's own recipe),
+   so this is a real free, not a pool-slot NULL: no 0x200-per-widget leak on
+   reload. FreeWidgetSlot re-checks the slot still holds OUR widget, so if the
+   game already reclaimed one we skip it instead of double-freeing. */
+extern "C" __attribute__((visibility("default")))
+void MenuKit_Shutdown(void)
+{
+    int freed = 0;
+    if(!s_pWidgetsPool)
+    {
+        memset(s_widgets, 0, sizeof(s_widgets));
+        return;
+    }
+    for(int i = 0; i < OUR_WIDGET_LIMIT; ++i)
+    {
+        WidgetEntry& e = s_widgets[i];
+        if(!e.active) continue;
+        if(e.widget) { MenuKit_FreeWidgetSlot(e.widget, e.slot); ++freed; }
+        e = WidgetEntry{};
+    }
+    s_tick = NULL; s_tickUser = NULL;   /* stop the pump touching freed entries */
+    logger->Info("MenuKit: shutdown, %d widget(s) freed", freed);
+}
 
 /* entry: framework main.cpp calls this from ON_MOD_LOAD */
 extern "C" __attribute__((visibility("default")))

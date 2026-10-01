@@ -2,6 +2,18 @@
 /obj/
 /libs/
 
+# Builds de host tests (openssl compilado, se regenera con host_test/build.sh)
+.build/
+
+# Binarios de host tests, recompilables con build.sh (el .c SI se versiona)
+examples/internet-radio/radio/host_test/test_net
+examples/internet-radio/radio/host_test/test_decode
+examples/internet-radio/radio/host_test/test_ring
+examples/internet-radio/radio/host_test/test_sink
+
+# Artefactos de prueba: el MP3 es material con copyright de terceros
+test.mp3
+
 # Termux / editor
 *.swp
 *~
