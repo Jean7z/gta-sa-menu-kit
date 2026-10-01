@@ -318,6 +318,14 @@ static int TapInsidePanel(float x, float y)
    Immediate-mode: no hay estado retenido, asi que REDIBUJAR cada frame es
    justamente como se anima. Todo esto se dibuja en pixeles reales, el mismo
    espacio que GetRect/GetTap. Borra este bloque para quitar la demo. */
+/* ---- v10 canvas text + arrastre -----------------------------------------
+   Las dos APIs nuevas juntas en un control real: el texto se dibuja EN MEDIO
+   del orden de dibujo (panel debajo, slider encima) y el knob se mueve con el
+   estado vivo del puntero. Si el orden de dibujo estuviera roto, la etiqueta
+   quedaria tapada; si GetPointer no sirviera, el knob no seguiria al dedo. */
+static float s_seek     = 0.5f;   /* 0..1 */
+static int   s_seekDrag = 0;
+
 static void DrawCanvasDemo(uint64_t now)
 {
     if(!s_api || s_api->version < 8) return;
@@ -376,6 +384,53 @@ static void DrawCanvasDemo(uint64_t now)
     /* Linea barriendo, con grosor variable. */
     s_api->DrawLine(x + 10.0f, y + h + 26.0f, x + w - 10.0f, y + h + 26.0f,
                     0x22D3EEFFu, 2.0f + 6.0f * pulse);
+
+    /* ---- seek arrastrable: geometria del knob primero, porque el estado se
+       actualiza ANTES de dibujar (si no, el knob dibujaria un frame tarde). */
+    const float bx = x + 16.0f, by = y + h - 18.0f, bw = w - 32.0f;
+
+    if(s_api->version >= 10)
+    {
+        float px = 0.0f, py = 0.0f; int down = 0;
+        if(s_api->GetPointer(&px, &py, &down))
+        {
+            /* Captura generosa (radio 28 px) alrededor del knob. GetTap no
+               alcanzaba: en un arrastre solo tendrias el frame del touchdown. */
+            if(down && !s_seekDrag)
+            {
+                const float dx = px - (bx + bw * s_seek);
+                const float dy = py - (by + 3.0f);
+                if(dx*dx + dy*dy <= 28.0f * 28.0f) s_seekDrag = 1;
+            }
+            if(s_seekDrag && down)
+            {
+                float v = (px - bx) / bw;
+                if(v < 0.0f) v = 0.0f;
+                if(v > 1.0f) v = 1.0f;
+                s_seek = v;
+            }
+            if(!down) s_seekDrag = 0;
+        }
+    }
+
+    /* Carril + relleno + knob. */
+    s_api->DrawRect(bx, by, bw, 6.0f, 0x334155FFu, 1);
+    s_api->DrawRect(bx, by, bw * s_seek, 6.0f, 0x38BDF8FFu, 1);
+    s_api->DrawCircle(bx + bw * s_seek, by + 3.0f, 9.0f,
+                      s_seekDrag ? 0xF97316FFu : 0xE2E8F0FFu, 1, 20);
+
+    /* Etiqueta de texto DESPUES de las formas: si el orden de dibujo se respeta,
+       queda encima del panel y del carril. */
+    if(s_api->version >= 10)
+    {
+        char lbl[32];
+        snprintf(lbl, sizeof lbl, "SEEK %3d%%", (int)(s_seek * 100.0f + 0.5f));
+        /* 5x7 a escala 2 = 12px de avance por caracter: la etiqueta son 9
+           caracteres, 108px. Anclada al borde derecho del panel. */
+        s_api->DrawText(x + w - 16.0f - 9.0f * 6.0f * 2.0f, y + 12.0f,
+                        lbl, 2, 0x38BDF8FFu);
+        s_api->DrawText(x + 16.0f, y + 12.0f, "MENUKIT V10", 2, 0x38BDF8FFu);
+    }
 }
 
 static void OnTick(void* userdata)
