@@ -6,12 +6,17 @@
 extern "C" {
 #endif
 
-#define MENUKIT_API_VERSION 8
+#define MENUKIT_API_VERSION 9
 
 typedef void (*MenuKit_OnReleaseCallback)(void* userdata);
 typedef void (*MenuKit_TickCallback)(void* userdata);
 
-/* API v7 - resolved by symbol from AML_PSDK_MenuKit64.so / AML_PSDK_MenuKit.so
+/* API v9 - resolved by symbol from AML_PSDK_MenuKit64.so / AML_PSDK_MenuKit.so
+   v9 changes: GetPointer appended at the END of the struct. GetTap is a
+   one-frame rising edge, so a client can see a tap but CANNOT follow a drag:
+   a slider, a swipe or a long-press all need to know "is the finger still
+   down, and where is it NOW", polled every frame. GetPointer is that read, in
+   the same real-pixel space as GetTap/GetRect, so the same hit-test works.
    v7 changes: GetTap + GetRect appended at the END of the struct. Global
    pointer access, so "tap outside to dismiss" is possible at all: AML exposes
    no touch/pad API, and a client could only react to touches on its OWN
@@ -188,6 +193,29 @@ typedef struct MenuKitAPI
     void (*DrawCircle)(float cx, float cy, float r, uint32_t rgba, int filled, int segments);
     void (*SetDrawBlend)(int src, int dst); /* rwBLEND* or -1 to reset */
     void (*ResetDrawState)(void);
+
+    /* v9: LIVE pointer state, polled every frame. Same real-pixel space as
+       GetTap/GetRect, so one hit-test serves all three.
+
+       GetTap answers "did a tap begin this frame" and is gone next frame - the
+       touch point at touchdown only. That is enough for a button but useless
+       for anything dragged: a slider, a swipe, a long-press and a scroll list
+       all need BOTH "still down" and "where is it right now", every frame.
+
+       down is 1 while any finger is on the glass. x/y are valid whenever down
+       is 1; they are the engine's own cached touch point, so they track a drag
+       rather than freezing at the tap.
+
+       Poll pattern for a drag control:
+           api->GetPointer(&px, &py, &down);
+           if(down && pressStarted) value = clamp(map(px));    // dragging
+           if(down && !pressStarted) { pressStarted = 1; }     // captured
+           else if(!down) pressStarted = 0;                    // released
+
+       Returns 0 if the pointer globals were not resolved, leaving the outs
+       untouched, so a client can degrade to a tap-only UI instead of acting
+       on garbage. */
+    int (*GetPointer)(float* x, float* y, int* down);
 } MenuKitAPI;
 
 /* Framework entrypoint. The framework .so exports this; client mods resolve it. */

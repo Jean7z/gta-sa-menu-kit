@@ -254,6 +254,12 @@ static bool   s_prevDown    = false;
 static int    s_tapThisFrame = 0;
 static float  s_tapX = 0.0f, s_tapY = 0.0f;
 static int    s_tapCount = 0;   /* DEBUG: counts rising edges to expose a bouncing signal */
+/* Bounded proof that m_vecCachedPos tracks a DRAG and not just the touchdown
+   point: logs only while a finger is down AND the point moved >4px since the
+   last line. This is the evidence GetPointer's drag story depends on - if the
+   engine only cached the initial press point, these would never fire. */
+static int    s_dragLogCount = 0;
+static float  s_dragLastX = 0.0f, s_dragLastY = 0.0f;
 
 /* Icon cache: same path -> same RwTexture (shared across buttons). Created
    once and NEVER destroyed by the mod: we write sprite[0] (+0x10) directly and
@@ -1030,6 +1036,22 @@ DECL_HOOKv(CGame_Process, void)
                 logger->Info("MenuKit: TAP#%d at (%g,%g) real px", s_tapCount, s_tapX, s_tapY);
             }
         }
+        /* Drag proof for v9 GetPointer: while a finger is down and the cached
+           point moves >4px from the last logged one, the engine is reporting a
+           live position, not a frozen touchdown point. A slider needs exactly
+           this. Bounded so holding still cannot spam. */
+        if(down && s_dragLogCount < 8)
+        {
+            float dx = s_pTouchPos[0] - s_dragLastX;
+            float dy = s_pTouchPos[1] - s_dragLastY;
+            if(dx * dx + dy * dy > 16.0f)
+            {
+                s_dragLogCount++;
+                s_dragLastX = s_pTouchPos[0];
+                s_dragLastY = s_pTouchPos[1];
+                logger->Info("MenuKit: DRAG#%d at (%g,%g) real px", s_dragLogCount, s_dragLastX, s_dragLastY);
+            }
+        }
         s_prevDown = down;
     }
 
@@ -1485,6 +1507,24 @@ static int MenuKit_GetTap(float* x, float* y)
     return 1;
 }
 
+/* v9: live pointer state, polled every frame. Reads the SAME engine statics
+   GetTap latches from, but without the rising-edge/one-frame gate, so a client
+   can follow a finger across the screen instead of only seeing where it landed.
+   That is the whole difference between a tap and a drag, and a slider, a swipe
+   or a scroll list are all drags.
+
+   The outs are left untouched on failure so a caller that forgot to check the
+   return value keeps its previous value instead of reading uninitialised
+   stack. */
+static int MenuKit_GetPointer(float* x, float* y, int* down)
+{
+    if(!s_pTouchDown || !s_pTouchPos) return 0;
+    if(x)    *x    = s_pTouchPos[0];
+    if(y)    *y    = s_pTouchPos[1];
+    if(down) *down = *s_pTouchDown ? 1 : 0;
+    return 1;
+}
+
 /* v7: live on-screen rect of a widget in real pixels (l, t, r, b). The engine
    already keeps these four floats in every widget object, and a client needs
    them for hit-testing, anchoring and tooltips. Pairs with GetTap: both are in
@@ -1636,7 +1676,8 @@ static MenuKitAPI g_api = {
     MenuKit_DrawPoly,
     MenuKit_DrawCircle,
     MenuKit_SetDrawBlend,
-    MenuKit_ResetDrawState
+    MenuKit_ResetDrawState,
+    MenuKit_GetPointer
 };
 
 const MenuKitAPI* GetMenuAPI(void) { return &g_api; }
