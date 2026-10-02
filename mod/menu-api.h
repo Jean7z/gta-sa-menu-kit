@@ -89,6 +89,24 @@ typedef struct MenuKitAPI
        keep the game's DB texture. Decoded by the engine via stb_image and
        turned into an RwTexture mirroring the game's own pipeline; loaded once
        and cached by path (shared by any button using the same file).
+
+       Two limits a client CANNOT see and should not have to discover:
+       (1) the image is box-filtered down to fit 512x512 before it becomes a
+       raster. Full-resolution covers (1200x1200 up to 3000x3000 were measured
+       in the wild) exhaust RenderWare's raster pool and SEGV inside
+       RwRasterSetFromImage — a 3000x3000 cover is 36 MiB of raster for a
+       widget that is a few hundred px wide. Pre-downscale your own art if you
+       want to control the filtering; do not pass full-res covers expecting
+       them to survive.
+       (2) the cache holds at most 48 paths (~48 MiB at the 512 cap). Textures
+       are NEVER freed - the framework cannot destroy one without risking
+       use-after-free on a raster the engine may already have recycled - so
+       that count is a HARD ceiling, not tuning. Past it AddButton still
+       succeeds but the widget falls back to the game's DB texture, and the
+       log carries one "icon cache at budget" warning. If your UI cycles
+       through more distinct images than that (a music player's covers, say),
+       expect the surplus to render with no icon.
+
        Returns an opaque handle, or NULL on failure (widget limit reached). */
     void* (*AddButton)(int menu, const char* texture, float x, float y, float scale,
                        MenuKit_OnReleaseCallback onRelease, void* userdata,

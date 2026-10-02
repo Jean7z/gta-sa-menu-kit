@@ -309,6 +309,11 @@ struct IconEntry
     unsigned char snap[16]; /* 16B at the center sample (red) */
 };
 static std::map<std::string, IconEntry> s_iconCache;
+/* Textures are NEVER freed (s_pfnRwTextureDestroy has no call sites), so this
+   cap is a hard ceiling on icon memory, not a cache tuning knob. 48 entries at
+   the 512 px cap is ~48 MiB of rasters. */
+#define ICON_CACHE_MAX_ENTRIES 48
+static bool s_iconCacheFullLogged = false;
 
 /* Plan B: label-texture cache. Same path-key trick as s_iconCache but keyed
    by the label string; rendered once and NEVER destroyed by the mod (same
@@ -336,6 +341,8 @@ struct WidgetEntry
     uint8_t     visible;      /* 0 = parked (not drawn, not touchable); SetVisible */
     int         hasSize;      /* 1 = sizeW/sizeH owned by us, not the engine's square */
     float       sizeW, sizeH; /* size in REAL pixels, applied around the engine's centre; SetSize */
+    int         sizeCal;      /* 1 = pxPerUnit* already calibrated against the engine */
+    float       pxPerUnitW, pxPerUnitH; /* real px per virtual unit, measured once from the engine */
     WidgetPosition pos;
 };
 static WidgetEntry s_widgets[OUR_WIDGET_LIMIT];
@@ -392,6 +399,46 @@ static bool MenuKit_IconContentAlive(const IconEntry& c)
    tricks: the stbi buffer lives only during the call (cpPixels is cleared
    before RwImageDestroy; flags bit0 never set, so the engine never frees it).
    Result is cached by path and never destroyed by the mod. */
+/* Covers arrive at 1200-1500 px but the widgets that display them are ~300 px,
+   and a raster costs w*h*4. Measured: three covers (1200^2 + 1400^2 + 1500^2 =
+   5.8+7.8+9 MB) exhaust the RenderWare raster pool, and the NEXT
+   RwRasterSetFromImage then writes into a pixel buffer the allocator could not
+   commit -> SIGSEGV SEGV_ACCERR, reproducibly on the 4th distinct cover.
+   Box-filter down to a cap BEFORE the raster is created: 512 px keeps ~1.7x
+   density on a 300 px widget and costs 1 MB instead of 9. */
+#define ICON_MAX_DIM 512
+
+static void Icon_DownscaleRGBA(const unsigned char* src, int sw, int sh,
+                               unsigned char* dst, int dw, int dh)
+{
+    for(int y = 0; y < dh; ++y)
+    {
+        int y0 = (int)((int64_t)y * sh / dh);
+        int y1 = (int)((int64_t)(y + 1) * sh / dh);
+        if(y1 <= y0) y1 = y0 + 1;
+        for(int x = 0; x < dw; ++x)
+        {
+            int x0 = (int)((int64_t)x * sw / dw);
+            int x1 = (int)((int64_t)(x + 1) * sw / dw);
+            if(x1 <= x0) x1 = x0 + 1;
+            unsigned r = 0, g = 0, b = 0, a = 0, n = 0;
+            for(int sy = y0; sy < y1; ++sy)
+            {
+                const unsigned char* row = src + (size_t)sy * sw * 4;
+                for(int sx = x0; sx < x1; ++sx)
+                {
+                    r += row[sx * 4 + 0]; g += row[sx * 4 + 1];
+                    b += row[sx * 4 + 2]; a += row[sx * 4 + 3];
+                    ++n;
+                }
+            }
+            unsigned char* o = dst + ((size_t)y * dw + x) * 4;
+            o[0] = (unsigned char)(r / n); o[1] = (unsigned char)(g / n);
+            o[2] = (unsigned char)(b / n); o[3] = (unsigned char)(a / n);
+        }
+    }
+}
+
 static void* MenuKit_LoadIcon(const char* path)
 {
     if(!path || !*path) return NULL;
@@ -426,9 +473,52 @@ static void* MenuKit_LoadIcon(const char* path)
         }
     }
 
+    /* NOTHING in this framework ever frees a texture: s_pfnRwTextureDestroy is
+       resolved but has zero call sites. So every texture we build leaks for the
+       rest of the process, and s_iconCache is what stops us building the SAME
+       one twice. Bound the leak by refusing to build once the cache is at its
+       budget, NOT by destroying: calling RwTextureDestroy on a raster the engine
+       may already have recycled is use-after-free, and mutating the refcount at
+       +0x64 to "make it safe" is a guess about engine internals on a field the
+       liveness check only ever READS. Returning NULL here is safe: both callers
+       fall back to the widget's default sprite. */
+    if(s_iconCache.size() >= ICON_CACHE_MAX_ENTRIES)
+    {
+        if(!s_iconCacheFullLogged)
+        {
+            s_iconCacheFullLogged = true;
+            logger->Print(LogP_Warn, "MenuKit: icon cache at budget (%d entries, ~%d MiB of rasters at %d px) — "
+                         "further icons skipped; textures are never freed, so this is a "
+                         "hard memory ceiling, not a soft one",
+                         ICON_CACHE_MAX_ENTRIES,
+                         (int)((size_t)ICON_CACHE_MAX_ENTRIES * ICON_MAX_DIM * ICON_MAX_DIM * 4 / (1024 * 1024)),
+                         ICON_MAX_DIM);
+        }
+        return NULL;
+    }
+
     int w = 0, h = 0, ch = 0;
     stbi_uc* px = stbi_load(path, &w, &h, &ch, 4);   /* RGBA8 */
     if(!px) { logger->Error("MenuKit: icon '%s' not decodable", path); return NULL; }
+
+    /* Never hand the raster a full-resolution cover: see ICON_MAX_DIM. */
+    if(w > ICON_MAX_DIM || h > ICON_MAX_DIM)
+    {
+        int nw, nh;
+        if(w >= h) { nw = ICON_MAX_DIM; nh = (int)((int64_t)h * ICON_MAX_DIM / w); }
+        else       { nh = ICON_MAX_DIM; nw = (int)((int64_t)w * ICON_MAX_DIM / h); }
+        if(nw < 1) nw = 1;
+        if(nh < 1) nh = 1;
+        stbi_uc* small = (stbi_uc*)malloc((size_t)nw * (size_t)nh * 4);
+        if(small)
+        {
+            Icon_DownscaleRGBA(px, w, h, small, nw, nh);
+            stbi_image_free(px);
+            px = small;
+            logger->Info("MenuKit: icon '%s' %dx%d -> %dx%d (raster pool is finite)", path, w, h, nw, nh);
+            w = nw; h = nh;
+        }
+    }
 
     void* img = s_pfnRwImageCreate(w, h, 32);
     if(!img) { stbi_image_free(px); return NULL; }
@@ -969,30 +1059,44 @@ static void MenuKit_ApplyState(WidgetEntry* e)
     if(!e->widget) return;
     if(e->hasSize)
     {
-        /* Resize around the CENTRE the engine already computed, not around a
-           coordinate we guessed: the engine's own virtual-unit placement is
-           correct and device-independent, so reusing its centre keeps the
-           anchoring working while decoupling width from height. Reading and
-           rewriting the same four floats is idempotent, so re-asserting every
-           frame converges instead of drifting. */
-        float* r = (float*)((uintptr_t)e->widget + 0x2c);
+        /* The rect at +0x2c is DERIVED state: the engine recomputes it from
+           pos.w/pos.h every frame, and it does that AFTER this hook runs, so
+           writing the rect here was silently discarded. Measured: SetSize was a
+           complete no-op while its own log reported success (scale=20 widgets
+           both measured 100x100, with and without SetSize(300,150)). pos is the
+           source of truth, so pos is what we write.
+
+           The factor is CALIBRATED once against the engine's own square instead
+           of hardcoded, because the two axes do not share a scale: measured,
+           pos.x is the centre at realW/640 per virtual unit while pos.w is at
+           realW/320. Deriving it from the engine keeps it correct on any
+           resolution, and works for non-square sizes that a hardcoded divisor
+           would get wrong.
+
+           Anchoring stays correct for free: pos.x is the centre, so widening
+           pos.w grows the widget symmetrically - the documented "resize around
+           the centre" behaviour, no separate rect maths needed. */
+        const float* r = (const float*)((uintptr_t)e->widget + 0x2c);
+        float* pos = (float*)((uintptr_t)e->widget + 0x18);   /* x, y, w, h */
         /* 1e6 sentinel: the engine has not laid this widget out yet, so its rect
-           is not a position and centring on it would write a rect around 2e6.
-           Skip ONLY the resize - alpha/fade/flags below are independent of the
-           rect and must still land, or a not-yet-laid-out widget would keep the
-           visible state the engine gave it. */
+           is not a measurement and calibrating from it would poison the factor
+           for the widget's whole life. Skip ONLY the resize - alpha/fade/flags
+           below are independent of the rect and must still land, or a
+           not-yet-laid-out widget would keep the visible state the engine gave it. */
         if(r[0] <= 1e5f && r[1] <= 1e5f)
         {
-            float cx = (r[0] + r[2]) * 0.5f;
-            float cy = (r[1] + r[3]) * 0.5f;
-            /* The engine's rect is bottom-up: r[1]=BOTTOM, r[3]=TOP. Rewrite in
-               the SAME order so the centre is preserved and the vertical
-               orientation matches the engine's own layout (writing min first
-               here would flip the widget top/bottom every frame). */
-            r[0] = cx - e->sizeW * 0.5f;
-            r[1] = cy + e->sizeH * 0.5f;   /* bottom */
-            r[2] = cx + e->sizeW * 0.5f;
-            r[3] = cy - e->sizeH * 0.5f;   /* top */
+            float rw = r[2] - r[0];       /* engine's real px width */
+            float rh = r[1] - r[3];       /* r[1]=BOTTOM, r[3]=TOP */
+            if(!e->sizeCal)
+            {
+                if(rw > 0.5f && pos[2] > 0.0f) e->pxPerUnitW = rw / pos[2];
+                if(rh > 0.5f && pos[3] > 0.0f) e->pxPerUnitH = rh / pos[3];
+                /* Only latch once BOTH axes have a usable factor, otherwise a
+                   half-measured value would silently pin one axis wrong. */
+                if(e->pxPerUnitW > 0.0f && e->pxPerUnitH > 0.0f) e->sizeCal = 1;
+            }
+            if(e->pxPerUnitW > 0.0f) pos[2] = e->sizeW / e->pxPerUnitW;
+            if(e->pxPerUnitH > 0.0f) pos[3] = e->sizeH / e->pxPerUnitH;
         }
     }
     uint8_t*  pAlpha = (uint8_t*)((uintptr_t)e->widget + 0x58);
@@ -1364,6 +1468,9 @@ static void* MenuKit_AddButton(int menu, const char* texture, float x, float y, 
     e->alpha = 0xFF;   /* opaque unless SetAlpha says otherwise before the build */
     e->visible = 1;    /* shown unless SetVisible parks it before the build */
     e->hasSize = 0;    /* engine keeps its square size until SetSize is called */
+    e->sizeCal = 0;    /* pxPerUnit* measured lazily on the first laid-out frame */
+    e->pxPerUnitW = 0.0f;
+    e->pxPerUnitH = 0.0f;
     e->onRelease = onRelease;
     e->userdata = userdata;
     memset(e->icon, 0, sizeof(e->icon));
