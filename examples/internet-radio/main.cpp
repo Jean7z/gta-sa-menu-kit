@@ -431,12 +431,16 @@ static void LayoutCard(void)
     const float cx = s_screenW * 0.5f;
     s_cardX = cx - CARD_W * 0.5f;
     s_cardY = s_screenH - CARD_BOTTOM - CARD_H;
-    s_bxPrev = cx - BTN_GAP;
+    /* Los dos de saltar van cruzados respecto a lo de mas abajo: "atras" ocupa
+       la derecha y "adelante" la izquierda. Cada boton se lleva consigo su glifo
+       y su accion, asi que esto es solo cambiar de sitio: no hay que tocar ni el
+       hit-test ni las llamadas a radio_local_skip. */
+    s_bxPrev = cx + BTN_GAP;
     s_bxPlay = cx;
-    s_bxNext = cx + BTN_GAP;
+    s_bxNext = cx - BTN_GAP;
     s_bY     = s_cardY + CARD_H - 48.0f;
     /* El chevron de replegar va al extremo derecho de la fila de botones: a la
-       derecha de "next" sobra sitio de sobra, y la esquina de arriba esta
+       derecha del ultimo boton sobra sitio de sobra, y la esquina de arriba esta
        ocupada por el titulo a la izquierda y el estado a la derecha. */
     s_closeX = s_cardX + CARD_W - CARD_PAD - 14.0f;
     s_closeY = s_bY;
