@@ -17,7 +17,6 @@ git clone --recursive https://github.com/Jean7z/gta-sa-menu-kit
 cd gta-sa-menu-kit
 ~/android-ndk-r29/ndk-build
 # salida: libs/arm64-v8a/libAML_PSDK_MenuKit64.so
-#         libs/arm64-v8a/libAML_PSDK_InternetRadio64.so
 ```
 
 Si clonaste sin `--recursive`: `git submodule update --init --recursive`.
@@ -39,8 +38,8 @@ de archivos, así que el paso normal es Shizuku (en Termux, `rish`):
 Con root o en Android 10 o anterior, `adb push` a `/sdcard/Android/data/com.rockstargames.gtasa/mods/`
 funciona directamente.
 
-AML carga los mods en orden alfabético, así que `MenuKit` carga antes que
-`InternetRadio`. Los clientes llaman a `MenuKit_GetAPI()`, que resuelve el
+AML carga los mods en orden alfabético, así que `AML_PSDK_MenuKit64` carga antes
+que cualquier cliente. Los clientes llaman a `MenuKit_GetAPI()`, que resuelve el
 framework en runtime y devuelve `NULL` si todavía no está.
 
 ## API mínima
@@ -191,14 +190,6 @@ menú que no se ha abierto nunca se dibuja.
    ambos se re-afirman cada frame y no gastan slots del pool.
 3. Hit-test en px reales con `GetTap` y `GetRect`, nunca comparando con las
    coordenadas virtuales de `AddButton`: los dos espacios no se mezclan.
-
-## Ejemplo
-
-`examples/internet-radio` es un reproductor de audio local (decodifica con
-`AMediaExtractor` y reproduce con OpenSL ES; no descarga nada) que monta su UI
-entera con el lienzo: panel con alpha que late, ecualizador, círculo, triángulo
-que gira, línea que engorda, barra de seek arrastrable y etiqueta `MENUKIT V11`.
-Compila con el mismo `ndk-build` y produce `libAML_PSDK_InternetRadio64.so`.
 
 ## Límites
 
