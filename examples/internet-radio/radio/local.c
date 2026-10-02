@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define LLOG(l, ...) do { if((l)->log) (l)->log((l)->log_ctx, __VA_ARGS__); } while(0)
 
@@ -28,6 +29,10 @@ struct RadioLocal {
        hilo es el unico que mueve i). */
     volatile int   cmd;
     volatile int   cur_index; /* tema en curso, para la UI */
+    /* Pausa: el hilo y el decodificador siguen vivos, solo se deja de alimentar
+       el ring. Por eso reanudar continua en el punto exacto y no desde el
+       principio, que es lo que hacia stop() + start(). */
+    volatile int   pause;
 };
 
 /* Recorre la lista en bucle (al llegar al final vuelve al principio) hasta que
@@ -83,7 +88,8 @@ static void* local_thread(void* arg)
 
                 /* Skip: se comprueba ENTRE chunks. radio_ring_write de abajo
                    espera como mucho a que se libere un chunk, asi que la
-                   latencia maxima es ese vaciado, no un frame. */
+                   latencia maxima es ese vaciado, no un frame. Va ANTES de la
+                   pausa para que(next) en pausa cambie de pista sin reanudar. */
                 if(l->cmd)
                 {
                     int c = l->cmd;
@@ -91,6 +97,19 @@ static void* local_thread(void* arg)
                     i = c > 0 ? (i + 1) % n : (i - 1 + n) % n;
                     skipped = 1;
                     break;
+                }
+
+                /* Pausa: se descarta lo bufferizado (el silencio tiene que
+                   empezar ya, no dentro del cushion de 1.49 s) y luego solo se
+                   espera. Los 20 ms son el techo del retardo al reanudar. */
+                if(l->pause)
+                {
+                    struct timespec nap;
+                    radio_ring_discard(&l->sink.pcm);
+                    nap.tv_sec = 0;
+                    nap.tv_nsec = 20l * 1000l * 1000l;
+                    nanosleep(&nap, NULL);
+                    continue;
                 }
 
                 got = radio_meddec_read(d, pcm, RADIO_SINK_DEC_SAMPLES, &fmt);
@@ -204,6 +223,7 @@ int radio_local_start(RadioLocal* l)
     l->tracks = 0;
     l->cur[0] = 0;
     l->cmd = 0;
+    l->pause = 0;
     l->cur_index = -1;
 
     /* Ring PCM nuevo: el del arranque anterior puede llevar audio del formato
@@ -239,6 +259,21 @@ void radio_local_stop(RadioLocal* l)
     /* radio_sink_stop no hace join porque este sink no arranco su propio hilo
        (mp3 == NULL), pero si cierra el dispositivo de audio. */
     radio_sink_stop(&l->sink);
+}
+
+/* Pausa sin perder la posicion: el hilo y el decodificador siguen vivos, asi
+   que reanudar continua donde se quedo, a diferencia de stop() + start(), que
+   reinician la lista desde el principio. El skip sigue funcionando en pausa
+   porque se comprueba antes del flag. */
+void radio_local_pause(RadioLocal* l, int on)
+{
+    if(!l) return;
+    l->pause = on ? 1 : 0;
+}
+
+int radio_local_paused(const RadioLocal* l)
+{
+    return l ? l->pause : 0;
 }
 
 void radio_local_skip(RadioLocal* l, int dir)

@@ -1,11 +1,11 @@
-/* Internet Radio - reproductor local de musica, cliente de la API v5 de SA Menu Kit.
+/* Internet Radio - reproductor local de musica, cliente de la API v10 de SA Menu Kit.
    El boton recorre los ficheros de una carpeta y los decodifica el propio
    telefono (radio/meddec.c: AMediaExtractor + AMediaCodec), asi que suenan flac,
    m4a, opus, ogg... y no solo mp3. La eleccion de formato la hace el
    decodificador del sistema, no una lista nuestra.
-   UI: un boton minimo siempre visible en una esquina y, al tocarlo, un grupo
-   pequeño de controles que se autodestruye. Nada de barras permanentes ni
-   portadas gigantes tapando el HUD (ver la seccion UI mas abajo).
+   UI: una tarjeta de reproductor dibujada entera con el lienzo 2D del framework
+   (sin widgets nativos y sin texturas), con hit-test propio a traves de
+   GetPointer. Ver "UI" mas abajo.
    Todo lo que es CADENCIA y formato vive en radio/ (banco de host
    radio/host_test/test_sink.c); aqui solo se cablean start/stop, el salto de
    pista y los diagnosticos al parar.
@@ -26,7 +26,7 @@
 #include <ctime>
 #include <pthread.h>
 
-MYMODCFG(net.psdk.samod.internetradio, Internet Radio, 0.3, Jean7z)
+MYMODCFG(net.psdk.samod.internetradio, Internet Radio, 0.4, Jean7z)
 
 /* Carpeta de musica. Va en el external files dir DEL JUEGO, asi que el proceso
    puede leerla sin pedir ningun permiso: en Android 11+ el acceso al
@@ -42,135 +42,88 @@ MYMODCFG(net.psdk.samod.internetradio, Internet Radio, 0.3, Jean7z)
 #define RADIO_COVER_DIR "/sdcard/Android/data/com.rockstargames.gtasa/files/.covers"
 
 /* --- UI ---------------------------------------------------------------------
-   AddButton recibe el CENTRO en unidades VIRTUALES 640x448; GetRect devuelve
-   el rect en PIXELES REALES, y los dos ejes escalan DISTINTO. Medido en
-   dispositivo (render 1600x720) con GetRect sobre AddButton:
+   TODO se dibuja con el lienzo 2D, en PIXELES REALES (1600x720 medidos en
+   dispositivo). No hay widgets nativos: los tres controles son hit-test propio
+   sobre el puntero, que es lo unico que permite el lienzo inmediato.
 
-       x: 1600/640 = 2.500        y: 720/448 = 1.607
+   Lo que NO se puede hacer aqui, y por que:
 
-   O sea que NO hay un factor uniforme, y dos consecuencias practicas:
+   - Barra de progreso con porcentaje: la capa de radio (radio/local.h) NO
+     expone duracion ni posicion. Una barra de progreso dibujada con un contador
+     local seria una mentira (el valor no tendria nada que ver con el audio), asi
+     que no hay barra. Lo que se dibuja es actividad real: las barras laten solo
+     mientras el hilo de reproduccion esta metiendo muestras en el ring PCM.
 
-   1) Todo widget sale cuadrado en px reales (100x100 medido), asi que no hay
-      banners anchos ni rectangulos; el "panel" es un grupo apretado de
-      cuadrados y por eso los textos son cortos.
-   2) La huella VERTICAL de un widget en reales (100 px) es mayor que su
-      separacion virtual (40 unidades x 1.607 = 64 px). Cualquier hueco
-      calculado en verticales virtuales queda corto a proposito. Por eso el
-      toast va alineado a la fila y no debajo de ella.
+   - Texto con textura: se probo y en el dispositivo el sampler enlaza el raster
+     pero no llega a muestrear los pixeles subidos, asi que salia en blanco. El
+     texto va por la ruta de quads sin texturizar (DrawText), que ya funciona.
 
-   Ojo: OS_ScreenGetWidth/Height devolvio 1024x600 cuando el render real era
-   1600x720, asi que la escala NO se puede sacar de ahi. La unica fuente
-   fiable es GetRect sobre un widget ya construido.
-   La esquina es CONFIG (UI_ANCHOR), no una coordenada enterrada en el codigo. */
-enum { UI_TOP_LEFT, UI_TOP_RIGHT, UI_BOTTOM_LEFT, UI_BOTTOM_RIGHT };
+   - Bordes redondeados con un fan de perimetro: parpadea. Por eso el relleno es
+     4 circulos de esquina + 3 rectangulos (piezas convexas, sin strip) y el
+     borde son 4 arcos stroked cerrados. Es la combinacion que no titila.
 
-/* BOTTOM_LEFT porque es la unica esquina que no depende de resolver una
-   contradiccion que no se puede zafar sin mirar la pantalla:
+   - Tamano de pantalla: OS_ScreenGetWidth() miente (reporto 1024x600 con un
+     render real de 1600x720), asi que no se puede usar para colocar la tarjeta.
+     Se mide con un widget sonda, ver ProbeScreen(). */
+#define CARD_W          620.0f
+#define CARD_H          184.0f
+#define CARD_R           18.0f   /* radio de esquina */
+#define CARD_PAD         24.0f
+#define CARD_BOTTOM      28.0f   /* margen del borde inferior */
+#define BTN_GAP          78.0f   /* separacion centro a centro */
+#define BTN_R            22.0f   /* radio visual de prev/next */
+#define BTN_R_PLAY       30.0f   /* el play es el primario, se ve mas grande */
+#define BTN_TOUCH_PAD     8.0f   /* margen extra de hit-test (dedo, no raton) */
 
-     - El comentario anterior de este archivo decia TOP_LEFT "por medicion":
-       radar arriba-derecha, widgets nativos x=1229..1568 y=447..708 (bloque
-       inferior-derecho), columna izquierda libre.
-     - El usuario reporto que el boton trigger le cae ENCIMA del minimapa, lo
-       que contradice esa medicion: implicaria radar en la columna izquierda.
+#define R_BG          0xE60B1220u   /* tarjeta, casi opaca */
+#define R_EDGE        0xFF1E3A5Fu   /* borde de la tarjeta */
+#define R_ACCENT      0xFF38BDF8u   /* activo / en juego */
+#define R_TEXT        0xFFE2E8F0u   /* titulo */
+#define R_DIM         0xFF64748Bu   /* metadatos e iconos inactivos */
+#define R_LIVE        0xFF0EA5E9u   /* barras con audio fluyendo */
 
-   TOP_LEFT es incorrecta si el radar esta ahi; BOTTOM_LEFT es correcta bajo las
-   DOS hipotesis (columna izquierda libre, o radar en la parte alta de la
-   columna). Queda a un #define cambiarlo cuando se confirme donde esta el radar.
-   Ojo: con ty = 448-36 el trigger baja hasta y 612..712 px reales, o sea a 8 px
-   del borde inferior. Si al cambiar de esquina el trigger se recorta, es que el
-   render util es menor que 720 y UI_MARGIN hay que subirlo. */
-#define UI_ANCHOR        UI_BOTTOM_LEFT
-#define UI_MARGIN        36.0f
-#define UI_TRIGGER_S     20.0f   /* semiext => 40x40 virtuales (100x100 px reales) */
-#define UI_BTN_S         20.0f
-#define UI_BTN_GAP       4.0f
-#define UI_ROW_GAP       8.0f
-#define UI_TOAST_S       30.0f
-#define UI_ALPHA_DIM     0x80    /* 50% con el panel cerrado: se ve que hay algo */
-#define UI_ALPHA_ON      0xFF
-#define UI_AUTO_HIDE_MS  4000
-#define UI_TOAST_MS      2000
-
-/* Glifo del trigger. AddButton YA acepta icono (ultimo argumento = ruta ABSOLUTA
-   a un PNG; stbi_load detecta el formato por contenido, asi que un JPEG tambien
-   valdria). En cuanto exista un nota-musical.png esto pasa a ser la ruta y el
-   trigger deja de llevar texto. */
-#define UI_TRIGGER_GLYPH "R"
-
-/* Toast = el unico texto en pantalla, y solo 2 s. Corto a proposito: en un
-   cuadrado de 60 virtuales la fuente 5x7 no aguanta un nombre largo sin volverse
-   ilegible, asi que se corta aqui y el nombre entero vive en el log. */
-#define TOAST_MAX_CHARS 16
-
-/* Longitud maxima del nombre de pista que muestra el log y el toast. */
+/* Longitud maxima del nombre de pista que muestra el log y la tarjeta. */
 #define NAME_MAX_CHARS 40
 
 static const MenuKitAPI* s_api = NULL;
 static RadioLocal* s_local = NULL;
 static bool s_radioOn = false;
-static bool s_open = false;          /* panel desplegado */
-
-static void* s_trigger = NULL;       /* siempre visible */
-static void* s_prev    = NULL;       /* panel: solo con el panel abierto */
-static void* s_play    = NULL;
-static void* s_next    = NULL;
-static void* s_toast   = NULL;       /* feedback de estado, 2 s */
+static bool s_paused  = false;
 
 static char  s_dispName[NAME_MAX_CHARS + 1];
 static pthread_mutex_t s_nameLock = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t s_hideAtMs = 0;      /* deadline de auto-hide del panel */
-static uint64_t s_toastUntilMs = 0;
 
-/* Posiciones de la UI para la esquina configurada. La fila de 3 botones se ancla
-   al borde EXTERIOR del trigger y se abre hacia el centro de la pantalla, asi
-   que cabe entera en cualquier esquina sin salirse. */
-struct UiLayout { float tx, ty, rowY, x0, x1, x2, toastX, toastY; };
+/* Sonda de tamano de pantalla: un widget invisible y cuadrado, centrado en el
+   centro del espacio virtual (320,224), que el motor proyecta al centro EXACTO
+   del render. Con su rect en pixeles reales sale el ancho y el alto. */
+static void*  s_probe     = NULL;
+static float  s_screenW   = 0.0f;
+static float  s_screenH   = 0.0f;
+static uint64_t s_probeAt  = 0;
 
-static void ComputeLayout(struct UiLayout* L)
-{
-    int onRight = (UI_ANCHOR == UI_TOP_RIGHT || UI_ANCHOR == UI_BOTTOM_RIGHT);
-    int onTop   = (UI_ANCHOR == UI_TOP_LEFT   || UI_ANCHOR == UI_TOP_RIGHT);
-    float pitch = 2.0f * UI_BTN_S + UI_BTN_GAP;   /* centro a centro */
+/* Geometria de la tarjeta del frame actual (la escribe LayoutCard). */
+static float s_cardX, s_cardY, s_bxPrev, s_bxPlay, s_bxNext, s_bY;
+static int   s_press = 0;      /* boton pulsado: 1 prev, 2 play, 3 next */
+static int   s_wasDown = 0;    /* flanco de bajada del puntero */
+/* Nivel del medidor. El delta de muestras se promedia en una ventana de 200 ms en
+   lugar de mirar el frame: el decodificador entrega un chunk por cada ~186 ms de
+   audio, asi que un valor por frame alternaba "hay chunk" / "no hay chunk" y las
+   barras parpadeaban. Con la ventana el nivel cambia como mucho 5 veces por
+   segundo y ademas se recorre en rampa, asi que el movimiento es continuo. La
+   senal es la misma de antes: el total de muestras solo crece si el hilo de audio
+   esta escribiendo. */
+static float s_flow = 0.0f;          /* nivel actual, 0..1 */
+static float s_flowT = 0.0f;         /* objetivo del ultimo cierre de ventana */
+static long long s_winPrev = 0;      /* muestras al abrir la ventana */
+static uint64_t s_winAt = 0;         /* ms en que se abrio la ventana */
 
-    L->tx = onRight ? (640.0f - UI_MARGIN) : UI_MARGIN;
-    L->ty = onTop   ? UI_MARGIN : (448.0f - UI_MARGIN);
+#define B_BTN_PREV 1
+#define B_BTN_PLAY 2
+#define B_BTN_NEXT 3
 
-    /* La fila arranca PEGADA al borde interior del trigger y se abre hacia el
-       centro. Antes se anclaba al borde EXTERIOR y la fila se iba: en el lado
-       izquierdo el hueco medido era de 88 unidades virtuales frente a 48 en el
-       derecho, porque x0 salia de (tx - BTN_S) + total en vez de (tx + BTN_S).
-       Medido en dispositivo con GetRect: el trigger ocupaba x 40..140 px y la
-       fila empezaba en 360 px. */
-    if(onRight)
-    {
-        L->x2 = L->tx - UI_TRIGGER_S - UI_BTN_GAP - UI_BTN_S;
-        L->x1 = L->x2 - pitch;
-        L->x0 = L->x1 - pitch;
-    }
-    else
-    {
-        L->x0 = L->tx + UI_TRIGGER_S + UI_BTN_GAP + UI_BTN_S;
-        L->x1 = L->x0 + pitch;
-        L->x2 = L->x1 + pitch;
-    }
-
-    L->rowY = onTop ? (L->ty + UI_TRIGGER_S + UI_ROW_GAP + UI_BTN_S)
-                    : (L->ty - UI_TRIGGER_S - UI_ROW_GAP - UI_BTN_S);
-
-    /* El toast va AL LADO de la fila, no debajo: los widgets son cuadrados en
-       px reales (100 px de alto) pero su huella vertical virtual son solo ~62
-       px, asi que cualquier separacion calculada en unidades virtuales se queda
-       corta a proposito y el toast terminaba pisando a prev. Medido: toast en
-       x 125..275 contra prev en 150..250. Alineado a la fila no colisiona y no
-       depende de adivinar la escala vertical. */
-    L->toastX = onRight ? (L->x0 - UI_BTN_S - UI_BTN_GAP - UI_TOAST_S)
-                        : (L->x2 + UI_BTN_S + UI_BTN_GAP + UI_TOAST_S);
-    L->toastY = L->rowY;
-}
-
-/* Reloj de milisegundos. El unico con el que se puede hacer un auto-hide: AML no
-   da hook por frame (solo PRELOAD/LOAD/UNLOAD/CRASH), asi que el pump de
-   CGame_Process es lo que llama a SetTick, una vez por frame. */
+/* Reloj de milisegundos. El unico con el que se puede animar: AML no da hook por
+   frame (solo PRELOAD/LOAD/UNLOAD/CRASH), asi que el pump de CGame_Process es
+   lo que llama a SetTick, una vez por frame. */
 static uint64_t NowMs(void)
 {
     struct timespec ts;
@@ -247,221 +200,266 @@ static void SetDisplayName(const char* meta_title, const char* file_name)
     pthread_mutex_unlock(&s_nameLock);
 }
 
-/* Feedback de estado: aparece 2 s y se va. Sustituye a la etiqueta permanente,
-   que era justo lo que tapaba el HUD. */
-static void ShowToast(const char* prefix)
+/* Mide el render real con un widget sonda y lo libera. OS_ScreenGetWidth() no
+   sirve: dio 1024x600 con un render de 1600x720. El widget va centrado en el
+   centro del espacio virtual (320,224), que el motor proyecta al centro del
+   render, asi que con el borde izquierdo de un cuadrado de 100 px sale el ancho
+   (W = (left + 50) * 2) y con el superior el alto. Se descarta en cuanto se
+   logra, y si el motor no llegara a construirlo se cae al tamano medido en este
+   dispositivo para no dejar la UI sin pintar. */
+static void ProbeScreen(void)
 {
-    char name[NAME_MAX_CHARS + 1];
-    char label[64];
+    float l = 0.0f, t = 0.0f, r = 0.0f, b = 0.0f;
+    uint64_t now = NowMs();
 
-    if(!s_api || !s_toast) return;
+    if(s_screenW > 0.0f) return;
 
-    pthread_mutex_lock(&s_nameLock);
-    snprintf(name, sizeof name, "%s", s_dispName);
-    pthread_mutex_unlock(&s_nameLock);
-    name[TOAST_MAX_CHARS] = 0;
-
-    if(prefix && *prefix && name[0]) snprintf(label, sizeof label, "%s %s", prefix, name);
-    else if(name[0])                  snprintf(label, sizeof label, "%s", name);
-    else                              snprintf(label, sizeof label, "%s", prefix ? prefix : "");
-    if(!label[0]) snprintf(label, sizeof label, "-");
-
-    s_api->SetText(s_toast, label);
-    s_api->SetVisible(s_toast, 1);
-    s_toastUntilMs = NowMs() + UI_TOAST_MS;
-}
-
-static void SetPanelOpen(int open)
-{
-    int on = open != 0;
-    s_open = on;
-    if(!s_api) return;
-    if(s_prev) s_api->SetVisible(s_prev, on);
-    if(s_play) s_api->SetVisible(s_play, on);
-    if(s_next) s_api->SetVisible(s_next, on);
-    /* El trigger se queda siempre visible; solo cambia de intensidad. */
-    if(s_trigger) s_api->SetAlpha(s_trigger, on ? UI_ALPHA_ON : UI_ALPHA_DIM);
-    s_hideAtMs = NowMs() + UI_AUTO_HIDE_MS;
-}
-
-/* ¿El punto cae dentro del panel O sobre el trigger? GetTap y GetRect dan ambos
-   el mismo espacio (pixeles reales), asi que esto son cuatro comparaciones y
-   nada mas. El trigger se cuenta como "dentro" a proposito: si se contara como
-   fuera, al pulsarlo con el panel abierto mi logica de "toca fuera -> cerrar" lo
-   cerraria y acto seguido el callback del trigger (que alterna) lo reabriria:
-   parpadeo y nunca se cierra. Dejando el trigger fuera de este test, un toque
-   sobre el trigger lo lleva solo su callback (que si alterna bien), y un toque
-   fuera de ambos lo cierra esta logica. Un GetRect que devuelve 0 significa "el
-   motor aun no ha colocado ese widget" y se cuenta como fuera. */
-static int TapInsidePanel(float x, float y)
-{
-    void* hit[4];
-    int   n = 0, i;
-    float l, t, r, b;
-
-    if(s_trigger) hit[n++] = s_trigger;   /* Ver nota: el trigger lo maneja su callback */
-    if(s_prev)    hit[n++] = s_prev;
-    if(s_play)    hit[n++] = s_play;
-    if(s_next)    hit[n++] = s_next;
-    for(i = 0; i < n; ++i)
+    if(s_probe)
     {
-        if(!s_api->GetRect(hit[i], &l, &t, &r, &b)) continue;
-        if(x >= l && x <= r && y >= t && y <= b) return 1;
-    }
-    return 0;
-}
-
-/* Timer del cliente (SetTick). Auto-hide del panel y retirada del toast.
-   Los deadlines en 0 significan "nada pendiente": sin ese guardia el toast, que
-   arranca aparcado, se volveria a aparcar en cada frame (y a loguear). */
-/* ---- v8 canvas demo ----------------------------------------------------
-   Immediate-mode: no hay estado retenido, asi que REDIBUJAR cada frame es
-   justamente como se anima. Todo esto se dibuja en pixeles reales, el mismo
-   espacio que GetRect/GetTap. Borra este bloque para quitar la demo. */
-/* ---- v10 canvas text + arrastre -----------------------------------------
-   Las dos APIs nuevas juntas en un control real: el texto se dibuja EN MEDIO
-   del orden de dibujo (panel debajo, slider encima) y el knob se mueve con el
-   estado vivo del puntero. Si el orden de dibujo estuviera roto, la etiqueta
-   quedaria tapada; si GetPointer no sirviera, el knob no seguiria al dedo. */
-static float s_seek     = 0.5f;   /* 0..1 */
-static int   s_seekDrag = 0;
-
-static void DrawCanvasDemo(uint64_t now)
-{
-    if(!s_api || s_api->version < 8) return;
-
-    const float x = 60.0f, y = 60.0f, w = 300.0f, h = 100.0f;
-    const float pulse = 0.5f + 0.5f * (float)sin((float)(now % 1600) * 0.003927f);
-    const unsigned int a = (unsigned int)(60 + 195.0f * pulse);
-
-    /* Panel redondeado: relleno estable (sin fan de perímetro). Descompuesto en
-       piezas convexas: 4 círculos de esquina + 3 rectángulos axis-aligned. Esto
-       evita los parpadeos que produce un bucle de borde pasado a Canvas_Fan. */
-    const float rr = 14.0f;
-    /* Esquinas: TL, TR, BR, BL */
-    const float cxr[4] = { x+rr,   x+w-rr, x+w-rr, x+rr   };
-    const float cyr[4] = { y+rr,   y+rr,   y+h-rr, y+h-rr };
-    for(int c = 0; c < 4; ++c)
-        s_api->DrawCircle(cxr[c], cyr[c], rr, 0x101820u | (a << 24), 1, 20);
-
-    /* Rectángulos para rellenar el cuerpo (cubren huecos entre esquinas) */
-    /* Centro horizontal: cubre todo el ancho entre esquinas, altura h - 2*rr */
-    s_api->DrawRect(x + rr, y, w - 2.0f*rr, h, 0x101820u | (a << 24), 1);
-    /* Centro vertical: cubre columnas laterales entre esquinas, altura 2*rr */
-    s_api->DrawRect(x, y + rr, rr, h - 2.0f*rr, 0x101820u | (a << 24), 1);
-    s_api->DrawRect(x + w - rr, y + rr, rr, h - 2.0f*rr, 0x101820u | (a << 24), 1);
-
-    /* Borde: polígono de perímetro cerrado (stroke). No usa fan, así que es estable. */
-    {
-        float p[8 * 3 * 2];
-        int n = 0;
-        const float cx[4] = { x+rr,   x+w-rr, x+w-rr, x+rr   };
-        const float cy[4] = { y+rr,   y+rr,   y+h-rr, y+h-rr };
-        const float st[4] = { 4.7124f, 0.0f,  1.5708f, 3.14159f };
-        for(int c = 0; c < 4; ++c)
-            for(int k = 0; k < 3; ++k) {
-                const float ang = st[c] - (float)k * 0.7854f;
-                p[n*2]     = cx[c] + rr * (float)cos(ang);
-                p[n*2 + 1] = cy[c] + rr * (float)sin(ang);
-                ++n;
-            }
-        s_api->DrawPoly(p, n, 0x38BDF8FFu, 0, 1);   /* borde fijo */
-    }
-
-    /* Circulo que recorre el panel de izquierda a derecha. */
-    const float cxp = x + 20.0f + (w - 40.0f) * (((now % 2000) / 2000.0f));
-    s_api->DrawCircle(cxp, y + h*0.5f, 12.0f, 0xF97316FFu, 1, 24);
-
-    /* Triangulo girando sobre el borde inferior. */
-    const float rot = (float)(now % 3000) * 0.002094f;
-    const float ox = x + w - 34.0f, oy = y + 20.0f, orr = 13.0f;
-    const float t0 = rot, t1 = rot + 2.0944f, t2 = rot + 4.1888f;
-    s_api->DrawTriangle(ox + orr*(float)cos(t0), oy + orr*(float)sin(t0),
-                        ox + orr*(float)cos(t1), oy + orr*(float)sin(t1),
-                        ox + orr*(float)cos(t2), oy + orr*(float)sin(t2),
-                        0xA78BFAFFu, 1);
-
-    /* Linea barriendo, con grosor variable. */
-    s_api->DrawLine(x + 10.0f, y + h + 26.0f, x + w - 10.0f, y + h + 26.0f,
-                    0x22D3EEFFu, 2.0f + 6.0f * pulse);
-
-    /* ---- seek arrastrable: geometria del knob primero, porque el estado se
-       actualiza ANTES de dibujar (si no, el knob dibujaria un frame tarde). */
-    const float bx = x + 16.0f, by = y + h - 18.0f, bw = w - 32.0f;
-
-    if(s_api->version >= 10)
-    {
-        float px = 0.0f, py = 0.0f; int down = 0;
-        if(s_api->GetPointer(&px, &py, &down))
+        if(s_api->GetRect(s_probe, &l, &t, &r, &b))
         {
-            /* Captura generosa (radio 28 px) alrededor del knob. GetTap no
-               alcanzaba: en un arrastre solo tendrias el frame del touchdown. */
-            if(down && !s_seekDrag)
-            {
-                const float dx = px - (bx + bw * s_seek);
-                const float dy = py - (by + 3.0f);
-                if(dx*dx + dy*dy <= 28.0f * 28.0f) s_seekDrag = 1;
-            }
-            if(s_seekDrag && down)
-            {
-                float v = (px - bx) / bw;
-                if(v < 0.0f) v = 0.0f;
-                if(v > 1.0f) v = 1.0f;
-                s_seek = v;
-            }
-            if(!down) s_seekDrag = 0;
+            s_screenW = (l + 50.0f) * 2.0f;
+            s_screenH = (t + 50.0f) * 2.0f;
+            s_api->RemoveWidget(s_probe);
+            s_probe = NULL;
+            logger->Info("InternetRadio: render medido %.0fx%.0f px", s_screenW, s_screenH);
+            return;
+        }
+        if(now - s_probeAt < 1500u) return;
+    }
+
+    s_screenW = 1600.0f;
+    s_screenH = 720.0f;
+    if(s_probe) { s_api->RemoveWidget(s_probe); s_probe = NULL; }
+    logger->Error("InternetRadio: la sonda no dio rect; asumo %.0fx%.0f",
+                  s_screenW, s_screenH);
+}
+
+/* Recorta a max_chars y remata con ".." si sobra texto. El ancho de la fuente es
+   len*6*scale, asi que el recorte es lo que evita que el titulo se salga de la
+   tarjeta. */
+static void FitText(const char* in, char* out, size_t out_len, int max_chars)
+{
+    int n = 0;
+    if(!out_len) return;
+    if(in)
+        while(in[n] && n < max_chars && (size_t)n + 1 < out_len)
+        { out[n] = in[n]; ++n; }
+    if(in && in[n] && n == max_chars && n >= 2)
+    { n -= 2; out[n++] = '.'; out[n++] = '.'; }
+    out[n] = 0;
+}
+
+/* Relleno redondeado sin titilar: 4 circulos de esquina + 3 rectangulos que
+   cierran los huecos. Todas las piezas son convexas, que es lo que el abanico de
+   triangulos del lienzo sabe dibujar bien. */
+static void FillRoundRect(float x, float y, float w, float h, float r, unsigned int c)
+{
+    s_api->DrawCircle(x + r,     y + r,     r, c, 1, 20);
+    s_api->DrawCircle(x + w - r, y + r,     r, c, 1, 20);
+    s_api->DrawCircle(x + w - r, y + h - r, r, c, 1, 20);
+    s_api->DrawCircle(x + r,     y + h - r, r, c, 1, 20);
+    s_api->DrawRect(x + r, y,         w - 2.0f * r, h, c, 1);
+    s_api->DrawRect(x,     y + r,     r,           h - 2.0f * r, c, 1);
+    s_api->DrawRect(x + w - r, y + r, r,           h - 2.0f * r, c, 1);
+}
+
+/* Borde: 4 arcos + 4 lados rectos. Los arcos solos dejaban cuatro anillos
+   sueltos en las esquinas porque faltaban los lados que los unen. Los lados van
+   por DrawLine (quad de 2 triangulos), el mismo camino sobrio que el relleno: un
+   fan de perimetro para el borde es lo que parpadeaba. */
+static void StrokeRoundRect(float x, float y, float w, float h, float r, unsigned int c)
+{
+    s_api->DrawCircle(x + r,     y + r,     r, c, 0, 20);
+    s_api->DrawCircle(x + w - r, y + r,     r, c, 0, 20);
+    s_api->DrawCircle(x + w - r, y + h - r, r, c, 0, 20);
+    s_api->DrawCircle(x + r,     y + h - r, r, c, 0, 20);
+    s_api->DrawLine(x + r, y,         x + w - r, y,         c, 1.0f);
+    s_api->DrawLine(x + r, y + h,     x + w - r, y + h,     c, 1.0f);
+    s_api->DrawLine(x,     y + r,     x,         y + h - r, c, 1.0f);
+    s_api->DrawLine(x + w, y + r,     x + w,     y + h - r, c, 1.0f);
+}
+
+static void DrawPlayGlyph(float cx, float cy, float r, unsigned int c)
+{
+    const float h = r * 1.15f;
+    s_api->DrawTriangle(cx - r*0.45f, cy - h*0.5f,
+                        cx - r*0.45f, cy + h*0.5f,
+                        cx + r*0.85f, cy, c, 1);
+}
+
+static void DrawPauseGlyph(float cx, float cy, float r, unsigned int c)
+{
+    const float bw = r * 0.32f, bh = r * 1.10f;
+    s_api->DrawRect(cx - r*0.60f, cy - bh*0.5f, bw, bh, c, 1);
+    s_api->DrawRect(cx + r*0.28f, cy - bh*0.5f, bw, bh, c, 1);
+}
+
+/* Doble chevron: la convencion de "pista anterior/siguiente". dir = -1 izquierda,
+   +1 derecha. Cada triangulo lleva el apex hacia dir y la base hacia el lado
+   contrario; el segundo se desplaza hacia fuera para que se lean los dos. */
+static void DrawSkipGlyph(float cx, float cy, float r, int dir, unsigned int c)
+{
+    const float h  = r * 0.80f;
+    const float s  = (float)dir;          /* +1 mira a la derecha */
+    const float a1 = cx + 0.05f * r * s;
+    const float b1 = cx - 0.75f * r * s;
+    const float a2 = cx + 0.60f * r * s;
+    const float b2 = cx - 0.20f * r * s;
+    s_api->DrawTriangle(a1, cy - h, b1, cy, a1, cy + h, c, 1);
+    s_api->DrawTriangle(a2, cy - h, b2, cy, a2, cy + h, c, 1);
+}
+
+static int  RadioStart(void);
+static void RadioStop(void);
+static void RadioSetPaused(int paused);
+
+static float HitRadius(int id)
+{
+    return (id == B_BTN_PLAY ? BTN_R_PLAY : BTN_R) + BTN_TOUCH_PAD;
+}
+
+/* Un rectangulo de toque alrededor del centro. Cuadrado y no circulo porque es lo
+   que espera un dedo, y con BTN_TOUCH_PAD de margen el acierto no exige punteria. */
+static int HitTest(float px, float py, float cx, float cy, int id)
+{
+    const float r = HitRadius(id);
+    return px >= cx - r && px <= cx + r && py >= cy - r && py <= cy + r;
+}
+
+static void LayoutCard(void)
+{
+    const float cx = s_screenW * 0.5f;
+    s_cardX = cx - CARD_W * 0.5f;
+    s_cardY = s_screenH - CARD_BOTTOM - CARD_H;
+    s_bxPrev = cx - BTN_GAP;
+    s_bxPlay = cx;
+    s_bxNext = cx + BTN_GAP;
+    s_bY     = s_cardY + CARD_H - 48.0f;
+}
+
+/* Hit-test y accion. El flanco lo da el estado ANTERIOR del puntero: sin el, un
+   dedo que se queda apoyado sobre el play lo alternaria en cada frame. */
+static void HandleInput(void)
+{
+    float px = 0.0f, py = 0.0f;
+    int down = 0, id = 0;
+
+    if(!s_api->GetPointer(&px, &py, &down)) { s_wasDown = down; s_press = 0; return; }
+
+    if(down)
+    {
+        if     (HitTest(px, py, s_bxPrev, s_bY, B_BTN_PREV)) id = B_BTN_PREV;
+        else if(HitTest(px, py, s_bxPlay, s_bY, B_BTN_PLAY)) id = B_BTN_PLAY;
+        else if(HitTest(px, py, s_bxNext, s_bY, B_BTN_NEXT)) id = B_BTN_NEXT;
+    }
+
+    if(down && !s_wasDown)
+    {
+        if(id == B_BTN_PREV)      radio_local_skip(s_local, -1);
+        else if(id == B_BTN_NEXT) radio_local_skip(s_local, +1);
+        else if(id == B_BTN_PLAY)
+        {
+            if(!s_radioOn) RadioStart();
+            else RadioSetPaused(!s_paused);
         }
     }
 
-    /* Carril + relleno + knob. */
-    s_api->DrawRect(bx, by, bw, 6.0f, 0x334155FFu, 1);
-    s_api->DrawRect(bx, by, bw * s_seek, 6.0f, 0x38BDF8FFu, 1);
-    s_api->DrawCircle(bx + bw * s_seek, by + 3.0f, 9.0f,
-                      s_seekDrag ? 0xF97316FFu : 0xE2E8F0FFu, 1, 20);
+    s_press = id;
+    s_wasDown = down;
+}
 
-    /* Etiqueta de texto DESPUES de las formas: si el orden de dibujo se respeta,
-       queda encima del panel y del carril. */
-    if(s_api->version >= 10)
+static void DrawCard(uint64_t now)
+{
+    char title[64], meta[32], stat[16];
+    const float t2 = 12.0f;           /* avance a escala 2 (metadatos) */
+    const float t3 = 18.0f;           /* avance a escala 3 (titulo) */
+    int idx, count;
+    float nameY, barsY, i, amp;
+
+    /* --- tarjeta --- */
+    FillRoundRect(s_cardX, s_cardY, CARD_W, CARD_H, CARD_R, R_BG);
+    StrokeRoundRect(s_cardX, s_cardY, CARD_W, CARD_H, CARD_R, R_EDGE);
+
+    /* --- titulo: el nombre real de la pista --- */
+    pthread_mutex_lock(&s_nameLock);
+    if(s_dispName[0])
+        FitText(s_dispName, title, sizeof title, (int)((CARD_W - 2*CARD_PAD) / t3));
+    else
+        snprintf(title, sizeof title, "%s", s_radioOn ? "SCANNING" : "TAP PLAY");
+    pthread_mutex_unlock(&s_nameLock);
+
+    /* --- metadatos: posicion en la lista + estado --- */
+    idx   = s_local ? radio_local_index(s_local) : -1;
+    count = s_local ? radio_local_count(s_local) : 0;
+    if(idx >= 0 && count > 0) snprintf(meta, sizeof meta, "%d/%d", idx + 1, count);
+    else                      snprintf(meta, sizeof meta, "%d TRACKS", count);
+
+    nameY = s_cardY + 22.0f;
+    s_api->DrawText(s_cardX + CARD_PAD, nameY, title, 3, R_TEXT);
+    s_api->DrawText(s_cardX + CARD_PAD, nameY + 34.0f, meta, 2, R_DIM);
+
+    snprintf(stat, sizeof stat, "%s", s_paused ? "PAUSED" : (s_radioOn ? "PLAYING" : "STOPPED"));
+    s_api->DrawText(s_cardX + CARD_W - CARD_PAD - strlen(stat) * t2, nameY + 34.0f,
+                    stat, 2, s_paused ? R_DIM : (s_radioOn ? R_ACCENT : R_DIM));
+
+    /* --- actividad: cinco barras que laten SOLO si el hilo de audio esta
+           metiendo muestras en el ring. Sin duracion ni posicion, esta es la
+           unica lectura honesta del estado de la reproduccion.
+           s_flow ya viene suavizado (sube a tope con audio, decae sin el), asi
+           que la amplitud y el color salen de el directo. --- */
+    amp = 2.0f + 13.0f * s_flow;
+    barsY = s_cardY + 104.0f;
+    for(i = 0; i < 5; ++i)
     {
-        char lbl[32];
-        snprintf(lbl, sizeof lbl, "SEEK %3d%%", (int)(s_seek * 100.0f + 0.5f));
-        /* 5x7 a escala 2 = 12px de avance por caracter: la etiqueta son 9
-           caracteres, 108px. Anclada al borde derecho del panel. */
-        s_api->DrawText(x + w - 16.0f - 9.0f * 6.0f * 2.0f, y + 12.0f,
-                        lbl, 2, 0x38BDF8FFu);
-        s_api->DrawText(x + 16.0f, y + 12.0f, "MENUKIT V10", 2, 0x38BDF8FFu);
+        const float ph = (float)(now % 1100) * 0.0057f + i * 0.85f;
+        const float sw = 0.5f + 0.5f * sinf(ph);
+        const float bh = 3.0f + amp * (0.25f + 0.75f * sw);
+        s_api->DrawRect(s_cardX + CARD_PAD + i * 11.0f, barsY - bh, 6.0f, bh,
+                        s_flow > 0.05f ? R_LIVE : R_DIM, 1);
     }
+
+    /* --- controles: play y pause nunca coexisten, el estado real decide --- */
+    DrawSkipGlyph(s_bxPrev, s_bY, BTN_R, -1, s_press == B_BTN_PREV ? R_ACCENT : R_DIM);
+    DrawSkipGlyph(s_bxNext, s_bY, BTN_R, +1, s_press == B_BTN_NEXT ? R_ACCENT : R_DIM);
+    if(s_radioOn && !s_paused) DrawPauseGlyph(s_bxPlay, s_bY, BTN_R_PLAY, R_ACCENT);
+    else                      DrawPlayGlyph(s_bxPlay, s_bY, BTN_R_PLAY, R_TEXT);
 }
 
 static void OnTick(void* userdata)
 {
-    float tx = 0.0f, ty = 0.0f;
+    long long samples;
     uint64_t now;
     (void)userdata;
     if(!s_api) return;
     now = NowMs();
 
-    /* v7: tap global. Antes esto era imposible -AML no expone touch y solo se
-       reaccionaba a toques sobre los widgets propios-. Un toque DENTRO del panel
-       solo reinicia el reloj; uno FUERA lo cierra, que es el comportamiento que
-       se espera de un panel que aparece solo. */
-    if(s_api->GetTap(&tx, &ty))
-    {
-        if(s_open)
-        {
-            if(TapInsidePanel(tx, ty)) s_hideAtMs = now + UI_AUTO_HIDE_MS;
-            else                         SetPanelOpen(0);
-        }
-    }
+    ProbeScreen();
+    if(s_screenW <= 0.0f) return;   /* todavia no se sabe cuanto mide la pantalla */
 
-    if(s_open && s_hideAtMs && now >= s_hideAtMs) SetPanelOpen(0);
-    if(s_toastUntilMs && now >= s_toastUntilMs)
-    {
-        s_toastUntilMs = 0;
-        if(s_toast) s_api->SetVisible(s_toast, 0);
-    }
+    LayoutCard();
+    HandleInput();
 
-    DrawCanvasDemo(now);
+    /* Actividad real del audio: el total de muestras solo crece si el hilo de
+       reproduccion esta escribiendo, asi que su crecimiento es la senal de "suena".
+       Cuando el decodificador se atasca, las barras se quedan planas.
+       El crecimiento llega a trozos (un chunk por cada ~186 ms de audio), asi que
+       se cierra una ventana cada 200 ms en vez de mirar el frame: mirar el frame
+       hacia que el nivel alternase chunk/no-chunk y las barras parpadeasen. Luego
+       se recorre hacia el objetivo en rampa (sube mas rapido que baja, que es lo
+       que se ve natural) y las barras se mueven sin saltos. */
+    samples = s_local ? radio_local_samples(s_local) : 0;
+    if(now - s_winAt >= 200u)
+    {
+        s_flowT = (s_radioOn && !s_paused && samples > s_winPrev) ? 1.0f : 0.0f;
+        s_winPrev = samples;
+        s_winAt    = now;
+    }
+    s_flow += (s_flowT - s_flow) * (s_flowT > s_flow ? 0.35f : 0.12f);
+    if(s_flow < 0.0f) s_flow = 0.0f;
+    if(s_flow > 1.0f) s_flow = 1.0f;
+
+    DrawCard(now);
 }
 
 /* HILO DE AUDIO. Corren en el hilo de reproduccion, justo al abrir cada pista,
@@ -489,7 +487,6 @@ static void OnTrackChanged(void* ctx, const char* name, const char* path)
         logger->Info("InternetRadio: portada cacheada %s", cover);
 
     SetDisplayName(title, name);
-    ShowToast(NULL);   /* solo el nombre: el estado ya se vio al pulsar play */
 }
 
 static int RadioStart(void)
@@ -502,8 +499,22 @@ static int RadioStart(void)
         return -1;
     }
     s_radioOn = true;
+    s_paused  = false;
     logger->Info("InternetRadio: ON -> %s", RADIO_MUSIC_DIR);
     return 0;
+}
+
+/* Pausa de verdad: el hilo y el decodificador siguen vivos, asi que reanudar
+   continua en el punto exacto. Antes esto era stop() + start(), que reiniciaba
+   la lista desde la primera pista al volver a pulsar. */
+static void RadioSetPaused(int paused)
+{
+    if(!s_radioOn || !s_local) return;
+    if(s_paused == (paused != 0)) return;
+    radio_local_pause(s_local, paused ? 1 : 0);
+    s_paused = (paused != 0);
+    s_flow = 0.0f;               /* el medidor arranca plano al reanudar */
+    logger->Info("InternetRadio: %s", paused ? "PAUSE" : "RESUME");
 }
 
 static void RadioStop(void)
@@ -512,53 +523,13 @@ static void RadioStop(void)
     radio_local_stop(s_local);
     RadioLogStats();
     s_radioOn = false;
+    s_paused  = false;
+    s_flow = 0.0f;
     logger->Info("InternetRadio: OFF");
-}
-
-/* play/stop del panel. El boton es el que muestra ON/OFF, asi que su etiqueta
-   se refresca en cada cambio de estado. */
-static void OnPanelPlay(void* userdata)
-{
-    (void)userdata;
-    if(!s_open) return;
-    if(s_radioOn)
-    {
-        RadioStop();
-        if(s_play) s_api->SetText(s_play, "OFF");
-        ShowToast("OFF");
-    }
-    else if(RadioStart() == 0)
-    {
-        if(s_play) s_api->SetText(s_play, "ON");
-        ShowToast("ON");
-    }
-    s_hideAtMs = NowMs() + UI_AUTO_HIDE_MS;   /* interactuar reinicia el reloj */
-}
-
-static void OnSkip(void* userdata)
-{
-    int dir = (int)(intptr_t)userdata;   /* -1 anterior, +1 siguiente */
-
-    if(!s_open) return;
-    if(!s_radioOn)
-    {
-        logger->Info("InternetRadio: skip sin reproduccion, se ignora");
-        return;
-    }
-    radio_local_skip(s_local, dir);
-    s_hideAtMs = NowMs() + UI_AUTO_HIDE_MS;
-}
-
-static void OnTrigger(void* userdata)
-{
-    (void)userdata;
-    SetPanelOpen(!s_open);
 }
 
 ON_MOD_LOAD()
 {
-    struct UiLayout L;
-
     logger->SetTag("InternetRadio");
 
     s_api = MenuKit_GetAPI(aml);
@@ -567,9 +538,10 @@ ON_MOD_LOAD()
         logger->Error("InternetRadio: MenuKit framework not loaded (load AML_PSDK_MenuKit64 first)");
         return;
     }
-    if(s_api->version < 7)
+    /* La UI es lienzo puro con DrawText y GetPointer: v10 es el minimo. */
+    if(s_api->version < 10)
     {
-        logger->Error("InternetRadio: MenuKit API v7 required (got v%u) - actualiza AML_PSDK_MenuKit64",
+        logger->Error("InternetRadio: MenuKit API v10 required (got v%u) - actualiza AML_PSDK_MenuKit64",
                       s_api->version);
         s_api = NULL;
         return;
@@ -584,63 +556,24 @@ ON_MOD_LOAD()
     radio_local_set_log(s_local, RadioLog, NULL);
     radio_local_set_track_cb(s_local, OnTrackChanged, NULL);
 
-    ComputeLayout(&L);
-
-    /* "shoot" is a REAL texture name in the game's image DB (the native attack
-       button CWidgetButtonAttackC2 references it at libGTASA.so+0x83d611), and it
-       is never visible: with SetText the engine generates a dark panel with the
-       text centred over it, and with SetVisible(0) it early-returns before Draw. */
-    s_trigger = s_api->AddButton(0, "shoot", L.tx, L.ty, UI_TRIGGER_S, OnTrigger, NULL, NULL);
-    s_prev    = s_api->AddButton(0, "shoot", L.x0, L.rowY, UI_BTN_S, OnSkip, (void*)(intptr_t)-1, NULL);
-    s_play    = s_api->AddButton(0, "shoot", L.x1, L.rowY, UI_BTN_S, OnPanelPlay, NULL, NULL);
-    s_next    = s_api->AddButton(0, "shoot", L.x2, L.rowY, UI_BTN_S, OnSkip, (void*)(intptr_t)+1, NULL);
-    s_toast   = s_api->AddButton(0, "shoot", L.toastX, L.toastY, UI_TOAST_S, NULL, NULL, NULL);
-
-    if(!s_trigger || !s_prev || !s_play || !s_next || !s_toast)
+    /* Sonda de tamano de pantalla: cuadrada, centrada y APARCADA (SetVisible 0 =
+       ni se dibuja ni se toca). OnTick la lee una vez y la devuelve al pool. */
+    s_probe = s_api->AddButton(0, "shoot", 320.0f, 224.0f, 20.0f, NULL, NULL, NULL);
+    if(s_probe)
     {
-        logger->Error("InternetRadio: could not add root widgets");
-        return;
+        s_api->SetSize(s_probe, 100.0f, 100.0f);
+        s_api->SetVisible(s_probe, 0);
+        s_probeAt = NowMs();
     }
-
-    s_api->SetText(s_trigger, UI_TRIGGER_GLYPH);
-    s_api->SetText(s_prev, "<");
-    s_api->SetText(s_play, "OFF");
-    s_api->SetText(s_next, ">");
-    s_api->SetText(s_toast, "-");
-
-    /* Estado inicial: solo el trigger, atenuado. El panel y el toast arrancan
-       APARCADOS (SetVisible 0 = ni se dibujan ni tocan), no ocultos con alpha,
-       porque un alpha 0 seguiria interceptando toques. */
-    s_api->SetAlpha(s_trigger, UI_ALPHA_DIM);
-    s_api->SetVisible(s_prev, 0);
-    s_api->SetVisible(s_play, 0);
-    s_api->SetVisible(s_next, 0);
-    s_api->SetVisible(s_toast, 0);
-
-    /* v6: forma en PIXELES REALES, ancla del motor intacta. AddButton solo
-       acepta un `scale` uniforme, asi que todo widget que crea sale cuadrado;
-       SetSize separa ancho de alto conservando el CENTRO que ya calculo el
-       motor. Solo se cambia la FORMA: la esquina y el margen siguen siendo los
-       que el motor projecting de las unidades virtuales (640x448), que ya
-       funcionan y son independientes del dispositivo. Deliberadamente NO se
-       tocan las coordenadas: en coordenadas absolutas habria que conocer el
-       ancho real de pantalla, y OS_ScreenGetWidth() dio 1024x600 cuando el
-       render real es 1600x720 (medido), lo que dejaba el boton a mitad de
-       pantalla. */
+    else
     {
-        /* Trigger: cuadrado de 120 px reales. */
-        s_api->SetSize(s_trigger, 120.0f, 120.0f);
-        /* Boton de play: PANEL RECTANGULAR de 240x70 px. Antes del v6 esto era
-           imposible (cuadrado obligatorio). Es la prueba en vivo de que la
-           limitacion esta rota. */
-        s_api->SetSize(s_play, 240.0f, 70.0f);
+        logger->Error("InternetRadio: sin slots para la sonda de pantalla");
     }
 
     s_api->SetTick(OnTick, NULL);
 
-    logger->Info("InternetRadio: UI lista (trigger %d,%d | panel cerrado | auto-hide %d ms)",
-                 (int)L.tx, (int)L.ty, UI_AUTO_HIDE_MS);
-    logger->Info("InternetRadio: %d pistas en %s", radio_local_count(s_local), RADIO_MUSIC_DIR);
+    logger->Info("InternetRadio: UI de lienzo lista (%d pistas en %s)",
+                 radio_local_count(s_local), RADIO_MUSIC_DIR);
 }
 
 /* "Not guaranteed" segun amlmod.h: si el framework no avisa, la muerte del

@@ -133,6 +133,15 @@ size_t radio_ring_available(RadioRing* r)
     return n;
 }
 
+void radio_ring_discard(RadioRing* r)
+{
+    if(!r) return;
+    pthread_mutex_lock(&r->mtx);
+    r->head = r->tail;
+    pthread_cond_broadcast(&r->not_full);
+    pthread_mutex_unlock(&r->mtx);
+}
+
 void radio_ring_close(RadioRing* r)
 {
     pthread_mutex_lock(&r->mtx);

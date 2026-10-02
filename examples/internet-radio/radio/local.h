@@ -45,6 +45,13 @@ void radio_local_free(RadioLocal* l);
 int  radio_local_start(RadioLocal* l);
 void radio_local_stop(RadioLocal* l);
 
+/* Pausa/reanuda SIN perder la posicion: el hilo y el decodificador siguen
+   vivos y el ring se descarta, asi que reanudar continua en el punto exacto.
+   Es lo que distingue esto de stop() + start(), que reinician desde la primera
+   pista. El skip sigue valiendo en pausa. on = 1 pausa, on = 0 reanuda. */
+void radio_local_pause(RadioLocal* l, int on);
+int  radio_local_paused(const RadioLocal* l);
+
 /* Salta de pista: dir = +1 siguiente, -1 anterior, 0 no hace nada. La carpeta
    es una lista en bucle, asi que los extremos dan la vuelta.
    No hace falta despertador: el hilo comprueba el comando entre chunks de

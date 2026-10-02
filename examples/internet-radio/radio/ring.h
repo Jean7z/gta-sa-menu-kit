@@ -43,6 +43,11 @@ size_t radio_ring_read_nonblock(RadioRing* r, void* out, size_t len);
 /* Bytes currently buffered. */
 size_t radio_ring_available(RadioRing* r);
 
+/* Descarta lo que haya bufferizado. Para el pause del reproductor, que quiere
+   silencio ya y no dentro de 1.49 s de cushion: el consumidor de audio sigue
+   leyendo y se llevara silencio en su proxima llamada. */
+void radio_ring_discard(RadioRing* r);
+
 /* Abort pending/future writes and wake every waiter. */
 void radio_ring_close(RadioRing* r);
 
