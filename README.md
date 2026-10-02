@@ -5,6 +5,18 @@ registrados en el pool nativo de widgets del juego, y un lienzo 2D inmediato par
 dibujar formas, alpha y texto sin gastar slots. Todo se resuelve por símbolo vía
 IAML (`GetSym`), sin parchear bytes del binario.
 
+[![Version: 1.0](https://img.shields.io/badge/version-1.0-green.svg)](https://github.com/Jean7z/gta-sa-menu-kit/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![Game: GTA SA 2.10 Android](https://img.shields.io/badge/game-GTA%20SA%202.10%20Android-blueviolet.svg)]()
+[![Platform: Android](https://img.shields.io/badge/platform-Android-lightgrey.svg)]()
+[![Loader: AML](https://img.shields.io/badge/loader-Android%20Mod%20Loader-orange.svg)](https://github.com/AndroidModLoader/AndroidModLoader)
+
+Un plugin de [Android Mod Loader (AML)](https://github.com/AndroidModLoader/AndroidModLoader)
+para [GTA: San Andreas 2.10](https://github.com/gta-reversed/gta-reversed-android).
+Los mods clientes usan esta capa de UI: descargan el `.so` de
+[Releases](https://github.com/Jean7z/gta-sa-menu-kit/releases), lo colocan en la
+carpeta de mods y llaman a `MenuKit_GetAPI()`.
+
 **Solo arm64-v8a.** Los hooks están verificados contra el `libGTASA.so` de SA
 2.10, que es arm64 puro.
 
@@ -24,7 +36,9 @@ La ABI está fijada a arm64-v8a en `Application.mk`.
 
 ## Instalar
 
-Los `.so` van en la carpeta de mods de AML, que en el dispositivo es
+Descarga `libAML_PSDK_MenuKit64.so` de la página de
+[Releases](https://github.com/Jean7z/gta-sa-menu-kit/releases) (arm64-v8a) y
+colócalo en la carpeta de mods de AML, que en el dispositivo es
 `Android/data/com.rockstargames.gtasa/mods/`. AML no carga de `files/psdk/`.
 
 En Android 11+ esa carpeta no se puede escribir con `adb push` ni desde un gestor
@@ -46,7 +60,7 @@ framework en runtime y devuelve `NULL` si todavía no está.
 
 ```c
 const MenuKitAPI* api = MenuKit_GetAPI(aml);   // NULL si el framework no está
-if(!api || api->version < 10) return;           // el cliente aborta limpio
+if(!api || api->version < MENUKIT_API_VERSION) return;   // el cliente aborta limpio
 
 void* h = api->AddButton(0, "shoot", 320.0f, 380.0f, 60.0f, onRelease, ud, NULL);
 api->SetText(h, "RADIO");
@@ -183,7 +197,7 @@ menú que no se ha abierto nunca se dibuja.
 
 ## Reglas para clientes
 
-1. Gate por versión, no por offset: `if(!api || api->version < 10) return;`.
+1. Gate por versión, no por offset: `if(!api || api->version < MENUKIT_API_VERSION) return;`.
    Cada miembro nuevo se añade al final del struct, así que un cliente viejo
    compilado contra v4 sigue leyendo por offset y funciona.
 2. No reconstruyas para show-hide ni para resize. Usa `SetVisible` y `SetSize`;
