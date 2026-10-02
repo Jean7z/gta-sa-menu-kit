@@ -11,16 +11,17 @@
 #include <map>
 #include <string>
 
-/* stb_image: decodifica el PNG del icono custom del boton. La macro
-   STB_IMAGE_IMPLEMENTATION debe definirse exactamente aqui (unica TU). */
+/* stb_image: decodes the button's custom icon PNG. STB_IMAGE_IMPLEMENTATION
+   must be defined exactly here (the single TU that does it). */
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
-/* Plan B: fuente bitmap 5x7 embebida (dominio publico, layout Adafruit GFX).
-   El texto NO usa CFont (experimento Tarea 0: CFont no compone en este fork y
-   el flush rompe el HUD). En su lugar se rasteriza aqui en un buffer RGBA y se
-   sube por el MISMO pipeline de iconos (RwImage -> raster 0x10 -> clean textura),
-   horneado en la textura que Draw pinta -> composicion garantizada. */
+/* Plan B: embedded 5x7 bitmap font (public domain, Adafruit GFX layout).
+   Text does NOT use CFont (Task 0 experiment: CFont does not composite in this
+   fork and flushing it breaks the HUD). Instead it is rasterized here into an
+   RGBA buffer and uploaded through the SAME icon pipeline (RwImage -> raster
+   0x10 -> clean texture), baked into the very texture Draw paints -> guaranteed
+   composition. */
 #include "font5x7.h"
 
 #define MAX_POOL_SLOTS 190              /* game's widget pool size (MAX_WIDGETS_GAME) */
@@ -1759,13 +1760,13 @@ static void MenuKit_DrawTriangle(float x1, float y1, float x2, float y2, float x
 static void MenuKit_DrawLine(float x1, float y1, float x2, float y2, uint32_t rgba, float width)
 {
     if(width <= 0.0f) return;
-    /* Una linea SIEMPRE se rasteriza como un quad (2 triangulos, 6 indices).
-       Existia un atajo de 2 indices sueltos que estaba roto: el lote se dibuja
-       como RW_PRIMTYPE_TRI_LIST, que consume de 3 en 3, de modo que un par
-       suelto desalineaba todas las primitivas siguientes y una linea al final
-       del lote se comia indices de mas. Todo emisor del batch debe emitir
-       multiplos de 3. */
-    if(width < 1.0f) width = 1.0f;   /* el raster no hace sub-pixel */
+    /* A line is ALWAYS rasterized as a quad (2 triangles, 6 indices). There used
+       to be a 2-loose-indices shortcut, and it was broken: the batch is drawn as
+       RW_PRIMTYPE_TRI_LIST, which consumes indices 3 at a time, so a stray pair
+       misaligned every following primitive and a line at the end of the batch ran
+       off the end of the index buffer. Every batch emitter must emit multiples
+       of 3. */
+    if(width < 1.0f) width = 1.0f;   /* the raster has no sub-pixel */
     const float dx = x2 - x1, dy = y2 - y1;
     const float len = dx * dx + dy * dy;
     if(len < 1e-6f) return;

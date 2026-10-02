@@ -1,74 +1,75 @@
 # SA Menu Kit
 
-Framework de UI para mods de GTA SA en Android (AML). Da dos cosas: botones
-registrados en el pool nativo de widgets del juego, y un lienzo 2D inmediato para
-dibujar formas, alpha y texto sin gastar slots. Todo se resuelve por símbolo vía
-IAML (`GetSym`), sin parchear bytes del binario.
+UI framework for GTA SA mods on Android (AML). It gives you two things: buttons
+registered in the game's native widget pool, and an immediate-mode 2D canvas for
+drawing shapes, alpha and text without spending slots. Everything is resolved by
+symbol via IAML (`GetSym`), with no binary byte patching.
 
-[![Version: 1.0](https://img.shields.io/badge/version-1.0-green.svg)](https://github.com/Jean7z/gta-sa-menu-kit/releases)
+[![Version: 11.1](https://img.shields.io/badge/version-11.1-green.svg)](https://github.com/Jean7z/gta-sa-menu-kit/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Game: GTA SA 2.10 Android](https://img.shields.io/badge/game-GTA%20SA%202.10%20Android-blueviolet.svg)]()
 [![Platform: Android](https://img.shields.io/badge/platform-Android-lightgrey.svg)]()
 [![Loader: AML](https://img.shields.io/badge/loader-Android%20Mod%20Loader-orange.svg)](https://github.com/AndroidModLoader/AndroidModLoader)
 
-Un plugin de [Android Mod Loader (AML)](https://github.com/AndroidModLoader/AndroidModLoader)
-para [GTA: San Andreas 2.10](https://github.com/gta-reversed/gta-reversed-android).
-Los mods clientes usan esta capa de UI: descargan el `.so` de
-[Releases](https://github.com/Jean7z/gta-sa-menu-kit/releases), lo colocan en la
-carpeta de mods y llaman a `MenuKit_GetAPI()`.
+A plugin for [Android Mod Loader (AML)](https://github.com/AndroidModLoader/AndroidModLoader)
+targeting [GTA: San Andreas 2.10](https://github.com/gta-reversed/gta-reversed-android).
+Client mods use this UI layer: they download the `.so` from
+[Releases](https://github.com/Jean7z/gta-sa-menu-kit/releases), drop it into their
+mods folder, and call `MenuKit_GetAPI()`.
 
-**Solo arm64-v8a.** Los hooks están verificados contra el `libGTASA.so` de SA
-2.10, que es arm64 puro.
+**arm64-v8a only.** The hooks are verified against SA 2.10's `libGTASA.so`, which
+is pure arm64.
 
-## Compilar
+## Building
 
-El build necesita el submódulo `psdk` (Android Mod Loader PSDK).
+The build needs the `psdk` submodule (Android Mod Loader PSDK).
 
 ```sh
 git clone --recursive https://github.com/Jean7z/gta-sa-menu-kit
 cd gta-sa-menu-kit
 ~/android-ndk-r29/ndk-build
-# salida: libs/arm64-v8a/libAML_PSDK_MenuKit64.so
+# output: libs/arm64-v8a/libAML_PSDK_MenuKit64.so
 ```
 
-Si clonaste sin `--recursive`: `git submodule update --init --recursive`.
-La ABI está fijada a arm64-v8a en `Application.mk`.
+If you cloned without `--recursive`: `git submodule update --init --recursive`.
+The ABI is pinned to arm64-v8a in `Application.mk`.
 
-## Instalar
+## Installing
 
-Descarga `libAML_PSDK_MenuKit64.so` de la página de
-[Releases](https://github.com/Jean7z/gta-sa-menu-kit/releases) (arm64-v8a) y
-colócalo en la carpeta de mods de AML, que en el dispositivo es
-`Android/data/com.rockstargames.gtasa/mods/`. AML no carga de `files/psdk/`.
+Download `libAML_PSDK_MenuKit64.so` from
+[Releases](https://github.com/Jean7z/gta-sa-menu-kit/releases) (arm64-v8a) and
+put it in AML's mods folder, which on the device is
+`Android/data/com.rockstargames.gtasa/mods/`. AML does not load from
+`files/psdk/`.
 
-En Android 11+ esa carpeta no se puede escribir con `adb push` ni desde un gestor
-de archivos, así que el paso normal es Shizuku (en Termux, `rish`):
+On Android 11+ that folder cannot be written with `adb push` or from a file
+manager, so the normal route is Shizuku (in Termux, `rish`):
 
 ```sh
 ~/shizuku/rish -c "cp libs/arm64-v8a/libAML_PSDK_MenuKit64.so \
   /storage/emulated/0/Android/data/com.rockstargames.gtasa/mods/"
 ```
 
-Con root o en Android 10 o anterior, `adb push` a `/sdcard/Android/data/com.rockstargames.gtasa/mods/`
-funciona directamente.
+With root, or on Android 10 and earlier, `adb push` to
+`/sdcard/Android/data/com.rockstargames.gtasa/mods/` works directly.
 
-AML carga los mods en orden alfabético, así que `AML_PSDK_MenuKit64` carga antes
-que cualquier cliente. Los clientes llaman a `MenuKit_GetAPI()`, que resuelve el
-framework en runtime y devuelve `NULL` si todavía no está.
+AML loads mods in alphabetical order, so `AML_PSDK_MenuKit64` loads before any
+client. Clients call `MenuKit_GetAPI()`, which resolves the framework at runtime
+and returns `NULL` if it is not there yet.
 
-## API mínima
+## Minimal API
 
 ```c
-const MenuKitAPI* api = MenuKit_GetAPI(aml);   // NULL si el framework no está
-if(!api || api->version < MENUKIT_API_VERSION) return;   // el cliente aborta limpio
+const MenuKitAPI* api = MenuKit_GetAPI(aml);   // NULL if the framework isn't loaded
+if(!api || api->version < MENUKIT_API_VERSION) return;   // the client bails out cleanly
 
 void* h = api->AddButton(0, "shoot", 320.0f, 380.0f, 60.0f, onRelease, ud, NULL);
 api->SetText(h, "RADIO");
-api->SetSize(h, 220.0f, 90.0f);                 // px reales: rompe el cuadrado
-api->SetVisible(h, 0);                           // sin coste de rebuild
+api->SetSize(h, 220.0f, 90.0f);                 // real px: breaks the square
+api->SetVisible(h, 0);                           // no rebuild cost
 
-/* Lienzo 2D inmediato. El reloj es del cliente: el framework no da tiempo
-   porque cada cliente ya necesita el suyo para sus propios timers. */
+/* Immediate 2D canvas. The clock is the client's: the framework does not hand
+   out time because every client already needs its own for its own timers. */
 static unsigned NowMs(void)
 {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -84,136 +85,136 @@ static void Tick(void*)
 
     api->DrawRect(60, 60, 300, 100, 0x101820u | (a << 24), 1);   /* panel */
     api->DrawCircle(90 + (t % 200), 110, 12, 0xF97316FFu, 1, 24);
-    api->DrawText(60, 170, "MENUKIT V11", 2, 0x38BDF8FFu);       /* etiqueta */
+    api->DrawText(60, 170, "MENUKIT V11", 2, 0x38BDF8FFu);       /* label */
 }
 api->SetTick(Tick, NULL);
 ```
 
-## Referencia
+## Reference
 
 ### Widgets
 
-| Miembro | Qué hace |
+| Member | What it does |
 |---|---|
-| `AddButton(menu, texture, x, y, scale, onRelease, userdata, icon)` | Registra un `CWidgetButton` en el pool del juego. `menu=0` es el grupo ROOT, visible mientras no haya un menú abierto; `menu>=1` solo se ve mientras ese menú esté activo. `texture` es el nombre en la base de texturas del juego. `icon` es una ruta **absoluta** a un PNG RGBA, o `NULL` para la textura propia. Devuelve `NULL` si se agotó el pool. |
-| `RemoveWidget(handle)` | Libera el slot del pool. No-op con `NULL`. |
-| `IsReleased(handle)` | `true` una sola vez por release del dedo sobre el widget. |
-| `OpenMenu(menu)` / `CloseMenu()` | Apilan y desapilan menús. Devuelven `0` o `-1`; si el grupo no cabe en los slots libres, el menú no se abre. |
-| `SetText(handle, text)` | Pinta una etiqueta ASCII con la fuente 5x7 embebida. Siempre gana sobre el icono. `NULL` o `""` la quita. |
-| `SetTick(onTick, ud)` | Callback por frame, invocado desde el pump del framework. Es el único tick que AML expone (solo da `PRELOAD`/`LOAD`/`UNLOAD`/`CRASH`), y lo que hace posibles los timers de auto-ocultado. |
-| `SetAlpha(handle, 0..255)` | Alpha en widgets vivos. El framework re-afirma el valor cada frame desde el pump: una escritura única no basta, porque el update del motor corre dentro de `CGame_Process` y restauraba el byte. |
-| `SetVisible(handle, 0/1)` | Oculto = no dibujado y no táctil (limpia el flag touch-immune). `SetAlpha(0)` solo para el `Draw`: el rect táctil sigue vivo, y un botón invisible que se come taps es peor que no tenerlo. Preferido a Remove/Add para show-hide, porque Remove y Add liberan y reconstruyen el objeto del widget (512 B por build) y alternar por esa vía fuga en cada ciclo. |
-| `SetSize(handle, w, h)` | Redimensiona en píxeles reales manteniendo el centro que calculó el motor. Es la vía para romper el límite de widget cuadrado de `AddButton`. Habla px reales mientras `AddButton` habla virtuales, así que no le pases coordenadas del layout. |
-| `GetTap(x, y)` | `1` en el frame que **empieza** un tap (flanco de subida) y escribe la posición; `0` si no. Mantener el dedo es un tap, no uno por frame. Es la primitiva de "toca fuera para cerrar": AML no expone API de touch, así que un cliente solo podía reaccionar a taps sobre sus propios widgets. Devuelve `0` si no se resolvieron los globales. |
-| `GetRect(handle, l, t, r, b)` | Rect vivo en pantalla, en píxeles reales. Empareja con `GetTap`: el hit-test son cuatro comparaciones, sin arithmetic de la proyección. `0` = handle desconocido o widget aún sin construir (preguntar el próximo frame). |
-| `GetPointer(x, y, down)` | Estado vivo del puntero, consultable cada frame, en el mismo espacio de px reales que `GetTap` y `GetRect`. `GetTap` es un flanco de subida que desaparece al frame siguiente: sirve para un botón, no para un arrastre. Un slider, un swipe o un long-press necesitan saber si el dedo sigue abajo y dónde está ahora. `down=1` mientras hay dedo en la pantalla. `0` si no se resolvieron los globales. |
-| `GetMenuUp()` | `1` si el juego tiene algún menú abierto, `0` si no, `-1` si no se encontró el símbolo. Existe porque con un menú abierto el dedo sigue siendo del juego, pero el lienzo del cliente ve ese mismo toque crudo, así que una UI dibujada encima se come los taps del menú. Un cliente con overlay debería ignorar entrada mientras devuelva `1`. Se resuelve por símbolo, sin offsets fijos. |
+| `AddButton(menu, texture, x, y, scale, onRelease, userdata, icon)` | Registers a `CWidgetButton` in the game's pool. `menu=0` is the ROOT group, visible while no menu is open; `menu>=1` is only visible while that menu is active. `texture` is a name in the game's texture DB. `icon` is an **absolute** path to an RGBA PNG, or `NULL` for the game's own texture. Returns `NULL` if the pool ran out. |
+| `RemoveWidget(handle)` | Frees the pool slot. No-op on `NULL`. |
+| `IsReleased(handle)` | `true` exactly once per finger release over the widget. |
+| `OpenMenu(menu)` / `CloseMenu()` | Push and pop menus. Return `0` or `-1`; if the group does not fit in the free slots, the menu does not open. |
+| `SetText(handle, text)` | Draws an ASCII label with the embedded 5x7 font. Always wins over the icon. `NULL` or `""` removes it. |
+| `SetTick(onTick, ud)` | Per-frame callback, invoked from the framework's pump. It is the only tick AML exposes (AML only gives `PRELOAD`/`LOAD`/`UNLOAD`/`CRASH`), and it is what makes auto-hide timers possible. |
+| `SetAlpha(handle, 0..255)` | Alpha on live widgets. The framework re-asserts the value every frame from the pump: a one-shot write is not enough, because the engine's update runs inside `CGame_Process` and restored the byte. |
+| `SetVisible(handle, 0/1)` | Hidden = not drawn and not touchable (clears the touch-immune flag). `SetAlpha(0)` only kills the `Draw`: the touch rect stays live, and an invisible button that still eats taps is worse than no button at all. Preferred over Remove/Add for show-hide, because neither Remove nor Add frees and rebuilds the widget object (512 B per build), so toggling that way leaks on every cycle. |
+| `SetSize(handle, w, h)` | Resizes in **real pixels**, keeping the centre the engine computed. This is the way to break `AddButton`'s square-widget limit. It speaks real px while `AddButton` speaks virtual units, so do not feed it layout coordinates. |
+| `GetTap(x, y)` | `1` on the frame a tap **begins** (rising edge) and writes the position; `0` otherwise. Holding a finger down is ONE tap, not one per frame. This is the primitive behind "tap outside to dismiss": AML exposes no touch API, so a client could only react to taps on its OWN widgets. Returns `0` if the globals were not resolved. |
+| `GetRect(handle, l, t, r, b)` | Live on-screen rect, in real pixels. Pairs with `GetTap`: the hit test is four comparisons, with none of the projection arithmetic. `0` = unknown handle, or widget not built yet (ask again next frame). |
+| `GetPointer(x, y, down)` | Live pointer state, pollable every frame, in the same real-pixel space as `GetTap` and `GetRect`. `GetTap` is a rising edge that vanishes on the next frame: fine for a button, useless for a drag. A slider, a swipe or a long-press all need to know whether the finger is still down and where it is now. `down=1` while a finger is on the screen. Returns `0` if the globals were not resolved. |
+| `GetMenuUp()` | `1` if the game has any menu open, `0` if not, `-1` if the symbol was not found. It exists because while a menu is open the finger still belongs to the game, but the client's canvas sees that same raw touch, so a UI drawn on top swallows the menu's taps. A client with an overlay should ignore input while this returns `1`. Resolved by symbol, no fixed offsets. |
 
-### Lienzo 2D inmediato
+### Immediate 2D canvas
 
-Las primitivas del lienzo no crean widgets: apilan geometría y la dibuja el
-framework en un lote por frame.
+The canvas primitives do not create widgets: they stack geometry and the
+framework draws it in one batch per frame.
 
-| Miembro | Qué hace |
+| Member | What it does |
 |---|---|
-| `DrawRect(x,y,w,h,rgba,filled)` | Rectángulo. `filled=1` relleno, `0` solo borde de 1 px. |
-| `DrawQuad(x1..y4,rgba,filled)` | Cuadrilátero libre (deformado o en perspectiva). |
-| `DrawTriangle(x1..y3,rgba,filled)` | Triángulo libre. |
-| `DrawLine(x1,y1,x2,y2,rgba,width)` | Línea de grosor real: por debajo de 1 px va al raster directo, por encima se construye con dos triángulos. |
-| `DrawPoly(xy,count,rgba,filled,closed)` | Polígono desde un array de pares `x,y`. `filled` usa abanico de triángulos: válido para convexos y formas estrelladas, no para contornos que se cruzan. `closed=0` deja la última arista abierta. |
-| `DrawCircle(cx,cy,r,rgba,filled,segments)` | Círculo, o anillo con `filled=0`. `segments` se limita a 3..128. |
-| `DrawText(x, y, text, scale, rgba)` | Texto en el lienzo, sin widget. `x,y` es la esquina superior izquierda en px reales; `scale` es el multiplicador del glifo (1 = 5x7 crudo, 1..16); el avance es `6*scale` por carácter, así que el ancho es `len*6*scale` sin llamadas extra. Los caracteres fuera de `0x20..0x7E` salen como `'?'`. |
-| `SetDrawBlend(src,dst)` | Modo de blend (`rwBLEND*`). `-1` restaura el valor por defecto. |
-| `ResetDrawState()` | Vuelve al blend por defecto (src-alpha / inv-src-alpha). |
+| `DrawRect(x,y,w,h,rgba,filled)` | Rectangle. `filled=1` fills, `0` draws a 1 px outline only. |
+| `DrawQuad(x1..y4,rgba,filled)` | Free quadrilateral (sheared or in perspective). |
+| `DrawTriangle(x1..y3,rgba,filled)` | Free triangle. |
+| `DrawLine(x1,y1,x2,y2,rgba,width)` | Line with real thickness: under 1 px it goes straight to the raster, above that it is built from two triangles. |
+| `DrawPoly(xy,count,rgba,filled,closed)` | Polygon from an array of `x,y` pairs. `filled` uses a triangle fan: valid for convex shapes and star shapes, not for self-intersecting outlines. `closed=0` leaves the last edge open. |
+| `DrawCircle(cx,cy,r,rgba,filled,segments)` | Circle, or ring with `filled=0`. `segments` is clamped to 3..128. |
+| `DrawText(x, y, text, scale, rgba)` | Canvas text, no widget. `x,y` is the top-left corner in real px; `scale` is the glyph multiplier (1 = raw 5x7, 1..16); the advance is `6*scale` per character, so the width is `len*6*scale` with no extra calls. Characters outside `0x20..0x7E` come out as `'?'`. |
+| `SetDrawBlend(src,dst)` | Blend mode (`rwBLEND*`). `-1` restores the default. |
+| `ResetDrawState()` | Back to the default blend (src-alpha / inv-src-alpha). |
 
-El contrato del lienzo:
+The canvas contract:
 
-- Es inmediato, no retained. No hay escena que mantener: lo que dibujas este frame
-  es lo que existe. Para animar, cambias los números y redibujas. El lote se
-  limpia al principio de cada frame, antes del tick.
-- Solo desde `SetTick`. El framework vuelca la geometría entera en una llamada
-  `RwIm2DRenderIndexedPrimitive` desde el hook de `Render2dStuff`, que es donde
-  el motor ya tiene el raster 2D montado. Dibujar desde el pump de
-  `CGame_Process` no funciona: corre antes de que exista ese contexto.
-- Las coordenadas son píxeles reales, el mismo espacio que `GetRect` y `GetTap`.
-- `rgba` va empaquetado `0xRRGGBBAA`, para animar un canal con un `<<`.
-- Techo del lote: 4096 vértices y 6144 índices por frame. Al llenarse se
-  descartan primitivas y se avisa por log una vez, en vez de romper el cliente.
-- `DrawText` va al mismo lote que las formas, un quad por run horizontal de
-  píxeles encendidos (unos 14 quads por glifo 5x7). Los glifos van sobre fondo
-  transparente, así que se ve lo que el cliente pintó detrás. El orden de dibujo
-  es el orden de llamada, también respecto a las formas: un rectángulo dibujado
-  antes de una etiqueta queda debajo, uno dibujado después la tapa.
+- It is immediate, not retained. There is no scene to maintain: what you draw
+  this frame is what exists. To animate, change the numbers and draw again. The
+  batch is cleared at the start of every frame, before the tick.
+- Only from `SetTick`. The framework flushes the whole geometry in a single
+  `RwIm2DRenderIndexedPrimitive` call from the `Render2dStuff` hook, which is
+  where the engine already has the 2D raster set up. Drawing from the
+  `CGame_Process` pump does not work: it runs before that context exists.
+- Coordinates are real pixels, the same space as `GetRect` and `GetTap`.
+- `rgba` is packed `0xRRGGBBAA`, so animating one channel is a `<<`.
+- Batch ceiling: 4096 vertices and 6144 indices per frame. Once full, primitives
+  are dropped and it is logged once, rather than breaking the client.
+- `DrawText` goes into the same batch as the shapes, one quad per horizontal run
+  of lit pixels (about 14 quads per 5x7 glyph). Glyphs sit on a transparent
+  background, so whatever the client painted behind shows through. Draw order is
+  call order, including with respect to the shapes: a rectangle drawn before a
+  label stays underneath, one drawn after covers it.
 
-  No lo implementes con una textura de etiqueta por glifo: esa ruta se probó
-  primero y en el dispositivo el sampler enlaza el raster pero no llega a
-  muestrear los píxeles subidos, así que el texto salía vacío. La versión que
-  funciona es la de quads sin texturizar.
-- El lienzo se dibuja encima de los widgets de AML. Está medido en dispositivo:
-  AML renderiza su UI en otro punto del frame, fuera de la pasada 2D del juego
-  y anterior a los dos. Mover el flush antes de esa pasada dio lo mismo y los dos
-  intentos crashearon, porque antes de que se ejecute no hay raster válido.
+  Do not implement this with a per-glyph label texture: that route was tried
+  first and on the device the sampler binds the raster but never gets to sample
+  the uploaded pixels, so the text came out empty. The version that works is the
+  untextured-quad one.
+- The canvas draws on top of AML's widgets. This is measured on device: AML
+  renders its UI at a different point in the frame, outside the game's 2D pass
+  and before it. Moving the flush earlier than that pass gave the same result
+  and both attempts crashed, because before it runs there is no valid raster.
 
-  En la práctica, pinta el panel entero con el lienzo en vez de mezclar arte del
-  lienzo con widgets de AML en la misma zona. Si se solapan, gana el lienzo.
+  In practice, paint a whole panel with the canvas instead of mixing canvas art
+  with AML widgets in the same area. If they overlap, the canvas wins.
 
-## Espacio de coordenadas
+## Coordinate space
 
-`x` e `y` de `AddButton` son coordenadas de origen en el espacio virtual 640x448
-del juego, no normalizadas 0-1. El botón de ataque nativo está en
-`Origen(560,380) Escala(20,20)`, y el centro de la pantalla es `(320,224)`.
+`x` and `y` in `AddButton` are origin coordinates in the game's virtual 640x448
+space, not normalized 0-1. The native attack button sits at
+`Origin(560,380) Scale(20,20)`, and the centre of the screen is `(320,224)`.
 
-Posición y tamaño siguen reglas distintas, y esto es lo que más sorprende al
-usar la API:
+Position and size follow different rules, and this is the thing that surprises
+people most when using the API:
 
 ```text
-posición x : realRenderWidth  / 640 = 2.500
-posición y : realRenderHeight / 448 = 1.607
-tamaño     : realRenderWidth  / 640  (uniforme en ambos ejes)
+position x : realRenderWidth  / 640 = 2.500
+position y : realRenderHeight / 448 = 1.607
+size       : realRenderWidth  / 640  (uniform on BOTH axes)
 ```
 
-Un widget sale cuadrado en píxeles reales (100x100 medido) aunque el espacio
-virtual sea 640x448, porque el tamaño usa el factor de ancho para los dos ejes
-mientras la posición usa un factor por eje. Como `scale` es un único `float`,
-`AddButton` solo puede construir cuadrados.
+A widget therefore lands square in real pixels (100x100 measured) even though
+the virtual space is 640x448, because size uses the width factor for both axes
+while position uses one factor per axis. Since `scale` is a single float,
+`AddButton` can only ever build squares.
 
-Dos trampas que salen de esto:
+Two traps fall out of this:
 
-1. Los huecos verticales salen ~36% cortos. La altura real de un widget (100 px)
-   es mayor que su huella vertical virtual (40 unidades x 1.607 = 64 px).
-   Calcular separaciones verticales en unidades virtuales hace que las formas
-   choquen donde debería haber margen. Deriva los huecos de `GetRect`.
-2. La resolución no se puede consultar. `OS_ScreenGetWidth()` miente: reporta
-   1024x600 contra un render real de 1600x720. `GetRect` sobre un widget ya
-   construido es la única fuente fiable.
+1. Vertical gaps come out ~36% too small. A widget's real height (100 px) is
+   larger than its virtual vertical footprint (40 units x 1.607 = 64 px).
+   Computing vertical spacing in virtual units makes shapes collide where there
+   should be margin. Derive gaps from `GetRect`.
+2. The resolution cannot be queried. `OS_ScreenGetWidth()` lies: it reports
+   1024x600 against a real 1600x720 render. `GetRect` on an already-built widget
+   is the only reliable source of truth.
 
-Por eso `SetSize` es size-only en píxeles reales en vez de dar coordenadas
-absolutas: no hay forma fiable de saber la escala para convertirlas.
+That is why `SetSize` is size-only in real pixels instead of taking absolute
+coordinates: there is no reliable way to know the scale to convert them with.
 
-El registro siempre es diferido: el `CWidgetButton` real lo construye el pump
-del motor en el primer `CGame::Process` posterior. Por eso llamar desde
-`ON_MOD_LOAD` es seguro, aunque el sistema de texturas no exista todavía, y un
-menú que no se ha abierto nunca se dibuja.
+Registration is always deferred: the real `CWidgetButton` is built by the engine's
+pump on the first `CGame::Process` afterwards. That is why calling from
+`ON_MOD_LOAD` is safe even though the texture system does not exist yet, and why
+a menu that was never opened is never drawn.
 
-## Reglas para clientes
+## Rules for clients
 
-1. Gate por versión, no por offset: `if(!api || api->version < MENUKIT_API_VERSION) return;`.
-   Cada miembro nuevo se añade al final del struct, así que un cliente viejo
-   compilado contra v4 sigue leyendo por offset y funciona.
-2. No reconstruyas para show-hide ni para resize. Usa `SetVisible` y `SetSize`;
-   ambos se re-afirman cada frame y no gastan slots del pool.
-3. Hit-test en px reales con `GetTap` y `GetRect`, nunca comparando con las
-   coordenadas virtuales de `AddButton`: los dos espacios no se mezclan.
+1. Gate on version, not on offsets: `if(!api || api->version < MENUKIT_API_VERSION) return;`.
+   Every new member is appended to the end of the struct, so an old client
+   compiled against v4 keeps reading by offset and keeps working.
+2. Do not rebuild for show-hide, and do not rebuild for resize. Use `SetVisible`
+   and `SetSize`; both are re-asserted every frame and spend no pool slots.
+3. Hit-test in real px with `GetTap` and `GetRect`, never by comparing against
+   `AddButton`'s virtual coordinates: the two spaces do not mix.
 
-## Límites
+## Limits
 
-- El pool nativo del juego tiene 190 slots y el juego ya ocupa unos 177, así que
-  quedan unos 13 libres. Reutiliza widgets en vez de reconstruir al cambiar de
-  estado. El lote del lienzo va aparte y no consume pool.
-- Solo arm64-v8a. SA 2.00 trae arm7, pero esos offsets nunca se comprobaron
-  contra su binario: un build v7a crashea en runtime, así que no se genera.
-- v11 verificado en dispositivo arm64-v8a: texto legible, seek arrastrable con la
-  etiqueta siguiendo el dedo, formas y alpha animando, y `GetMenuUp` haciendo que el
-  launcher no se coma el toque con el que se cierra el mapa.
-- Pendiente: `SetText` con fuente externa y limpieza de widgets huérfanos cuando
-  el juego reconstruye el pool a mitad de una pulsación.
+- The game's native pool has 190 slots and the game itself occupies about 177, so
+  roughly 13 are free. Reuse widgets instead of rebuilding when state changes.
+  The canvas batch is separate and consumes no pool.
+- arm64-v8a only. SA 2.00 ships arm7, but those offsets were never verified
+  against its binary: a v7a build crashes at runtime, so it is not produced.
+- v11 verified on an arm64-v8a device: legible text, a seek bar you can drag with
+  the label following your finger, shapes and alpha animating, and `GetMenuUp`
+  making the launcher stop swallowing the tap that closes the map.
+- Still open: `SetText` with an external font, and cleaning up orphaned widgets
+  when the game rebuilds the pool halfway through a press.
