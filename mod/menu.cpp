@@ -55,7 +55,7 @@ struct RwImageLayout {
     uint32_t height;   /* +0x08 */
     uint32_t depth;    /* +0x0c */
     uint32_t stride;   /* +0x10 — MUST be set before RwRasterSetFromImage */
-    uint32_t pad14;    /* +0x14 */
+    uint32_t pad14;    /* +0x14 — pointer alignment on arm64, not a field */
     uint8_t* cpPixels; /* +0x18 */
     void* rsvd20;      /* +0x20 (cpPixels2/palette) unused */
 };
@@ -112,13 +112,17 @@ struct RwIm2DVertex
 };
 typedef unsigned short RwImVertexIndex;
 
+/* RenderWare render-state ids (aml-psdk/renderware/RwRender.h enum
+   RwRenderState) and the blend ids from the same header. TEXTURERASTER takes a
+   pointer to an RwRaster - NOT to the RwTexture that wraps it. We bind it to NULL
+   before the untextured shape batch so the engine's last raster is not inherited. */
 enum { RW_RS_TEXTURE_RASTER = 1, RW_RS_ZTEST_ENABLE = 6, RW_RS_ZWRITE_ENABLE = 8,
        RW_RS_SRC_BLEND = 10, RW_RS_DST_BLEND = 11, RW_RS_VERTEX_ALPHA_ENABLE = 12 };
 enum { RW_BLEND_SRC_ALPHA = 5, RW_BLEND_INV_SRC_ALPHA = 6 };
 enum { RW_PRIMTYPE_TRI_LIST = 3 };
 
-#define CANVAS_MAX_VERTS  2048
-#define CANVAS_MAX_INDICES 3072
+#define CANVAS_MAX_VERTS  4096
+#define CANVAS_MAX_INDICES 6144
 
 static RwIm2DVertex   s_canvasVerts[CANVAS_MAX_VERTS];
 static RwImVertexIndex s_canvasIdx[CANVAS_MAX_INDICES];
@@ -127,24 +131,6 @@ static int s_canvasNumIdx   = 0;
 static int s_canvasSrcBlend = RW_BLEND_SRC_ALPHA;
 static int s_canvasDstBlend = RW_BLEND_INV_SRC_ALPHA;
 static int s_canvasLostVerts = 0;   /* overflow accounting, logged once */
-
-/* Textured quads waiting for the 2D pass, in call order. Text cannot join the
-   shape batch: that batch submits with a NULL raster, and a textured quad needs
-   a raster bound. It also cannot be a second independent batch flushed after the
-   shapes, because that would put every label on top of every shape regardless of
-   call order (a panel drawn after its label would cover it).
-
-   So text is recorded here and replayed in Canvas_Flush, interleaved with the
-   shape submissions: the shape batch is flushed before each text op, so whatever
-   the client queued before a label lands under it and whatever came after lands
-   on top. Deferring also matters for correctness, not just z: clients call
-   DrawText from their tick, and the engine's raster is only set up inside
-   Render2dStuff, so submitting there would draw outside the 2D pass. */
-#define CANVAS_MAX_TEXT_OPS 256
-struct CanvasTextOp { void* ras; RwIm2DVertex v[4]; };
-static CanvasTextOp s_canvasTextOps[CANVAS_MAX_TEXT_OPS];
-static int s_canvasTextOpCount = 0;
-static int s_canvasTextLost    = 0;
 
 static int   (*s_pfnRwRenderStateSet)(int, void*) = NULL;
 static int   (*s_pfnRwIm2DRenderIndexedPrimitive)(int, RwIm2DVertex*, int, RwImVertexIndex*, int) = NULL;
@@ -221,8 +207,6 @@ static void Canvas_Clear(void)
 {
     s_canvasNumVerts = 0;
     s_canvasNumIdx   = 0;
-    s_canvasTextOpCount = 0;
-    if(s_canvasTextLost) { logger->Info("MenuKit: text op overflow, %d label(s) dropped", s_canvasTextLost); s_canvasTextLost = 0; }
     if(s_canvasLostVerts) { logger->Info("MenuKit: canvas batch overflow, %d prim(s) dropped", s_canvasLostVerts); s_canvasLostVerts = 0; }
 }
 
@@ -251,33 +235,13 @@ static void Canvas_SubmitShapes(void)
     s_canvasNumIdx   = 0;
 }
 
-/* Submit the frame: shapes and text in call order. Called from the Render2dStuff
-   hook, i.e. after the engine has set up the 2D raster.
-
-   Replays s_canvasTextOps against the shape batch. Each text op first drains
-   whatever shapes the client queued before it, so the interleaving matches call
-   order exactly; with no text ops this collapses to the original single
-   untextured submission with no extra state changes. */
+/* Submit the frame. Called from the Render2dStuff hook, i.e. after the engine has
+   set up the 2D raster. Shapes and text share one untextured batch, so call order
+   is preserved by construction and there is nothing to interleave here. */
 static void Canvas_Flush(void)
 {
     if(!s_pfnRwRenderStateSet || !s_pfnRwIm2DRenderIndexedPrimitive) return;
-
-    for(int i = 0; i < s_canvasTextOpCount; ++i)
-    {
-        CanvasTextOp& op = s_canvasTextOps[i];
-        Canvas_SubmitShapes();   /* everything queued before this label */
-        s_pfnRwRenderStateSet(RW_RS_TEXTURE_RASTER, op.ras);
-        Canvas_SetBlendStates();
-        RwImVertexIndex idx[6] = { 0, 1, 2, 0, 2, 3 };
-        s_pfnRwIm2DRenderIndexedPrimitive(RW_PRIMTYPE_TRI_LIST, op.v, 4, idx, 6);
-    }
-
-    /* Leave the raster unbound: the engine's next draw must not inherit it, and
-       the shape path assumes untextured. */
-    if(s_canvasTextOpCount) s_pfnRwRenderStateSet(RW_RS_TEXTURE_RASTER, NULL);
-
-    Canvas_SubmitShapes();       /* everything queued after the last label */
-    s_canvasTextOpCount = 0;
+    Canvas_SubmitShapes();
 }
 
 
@@ -345,15 +309,6 @@ static std::map<std::string, IconEntry> s_iconCache;
    machinery: texture block recycling by the game is detected via the raster
    fingerprint re-check so the pump can re-render fresh. */
 static std::map<std::string, IconEntry> s_textCache;
-
-/* Canvas text cache. Distinct from s_textCache because the payload differs:
-   s_textCache holds label textures composited over a dark panel (Variant B),
-   which is what a native widget's sprite needs. Canvas text must be glyphs on
-   TRANSPARENT background so the client's own rounded-rect/circle shows through,
-   and it needs its raster for an immediate textured draw rather than for a
-   widget sprite. Same liveness rule (fingerprint re-check on every hit) and the
-   same never-destroy policy: these live until the game closes. */
-static std::map<std::string, IconEntry> s_canvasTextCache;
 
 /* Widget registry */
 struct WidgetEntry
@@ -1707,101 +1662,48 @@ static void MenuKit_DrawCircle(float cx, float cy, float r, uint32_t rgba, int f
     else       Canvas_Stroke(xy, segments, rgba, 1.0f, true);
 }
 
-/* DrawText: render a string with the embedded 5x7 font at an arbitrary pixel
-   position, scale and colour, independent of any widget.
-
-   The whole string is rasterised into ONE texture and drawn as ONE quad. No
-   per-glyph atlas, no UV bookkeeping across glyphs, no vertex counter: the
-   cost is one cached texture per distinct (text, scale, colour) and one quad
-   push per frame after that. A client drawing a screen of labels pays a
-   texture per unique string, which is the same price the native widget path
-   already charges for its label textures.
-
-   Immediate rather than batched, because it needs a raster bound while the
-   shape batch is deliberately untextured. Ordering survives because the shape
-   batch is flushed FIRST: anything the client drew before the label still
-   lands underneath it, and anything after lands on top.
-
-   Colour comes from the texture, not the vertex: the rasteriser bakes r,g,b
-   and alpha into the pixels, so the quad is modulated opaque white and the
-   alpha blend does the transparency. Double-modulating (tinted texture AND
-   tinted vertex) would square the alpha and wash the glyphs out. */
+/* Text goes into the shape batch as untextured quads, one per horizontal run of
+   lit font pixels. The immediate-mode textured path in this GL fork binds a raster
+   we build but never samples our pixels, while the shape batch is proven to
+   render on device - so reuse the path that works instead of guessing at
+   RenderWare internals. Runs rather than single pixels keep the count low (a 5x7
+   glyph is ~14 quads). Ordering comes for free: shapes and text share one batch,
+   so a panel drawn after its label still covers it. */
 static void MenuKit_DrawText(float x, float y, const char* text, int scale, uint32_t rgba)
 {
     if(!text || !*text) return;
     if(scale < 1) scale = 1;
     if(scale > 16) scale = 16;
-    if(!s_pfnRwRenderStateSet || !s_pfnRwIm2DRenderIndexedPrimitive) return;
-    if(!s_pfnRwTextureCreate || !s_pfnRwRasterCreate) return;
+    if(((rgba >> 24) & 0xFF) == 0) return;   /* fully transparent */
 
-    /* The vertex alpha convention here is r=byte0 .. a=byte3 (see Canvas_Push),
-       so unpack the packed colour the same way rather than assuming ABGR. */
-    const unsigned cr = (rgba        ) & 0xFF;
-    const unsigned cg = (rgba >>  8 ) & 0xFF;
-    const unsigned cb = (rgba >> 16 ) & 0xFF;
-    const unsigned ca = (rgba >> 24 ) & 0xFF;
-    if(ca == 0) return;   /* fully transparent: skip the upload entirely */
-
-    char key[320];
-    snprintf(key, sizeof(key), "cvs:%d|%02x%02x%02x%02x|%s", scale, cr, cg, cb, ca, text);
-
-    void* ras = NULL;
-    auto it = s_canvasTextCache.find(key);
-    if(it != s_canvasTextCache.end())
-    {
-        IconEntry& c = it->second;
-        /* Same liveness contract as the icon/label caches: the game can recycle
-           the texture block under us, which shows up as a raster mismatch. */
-        if(c.ok && c.tex && *(void**)c.tex == c.ras) ras = c.ras;
-        else { s_canvasTextCache.erase(it); }
-    }
-
-    size_t len = strlen(text);
-    /* The cache key is a fixed buffer, so a string long enough to be truncated
-       would collide with any other string sharing that prefix and get the wrong
-       texture. Bound the input instead of silently aliasing. */
+    const size_t len = strlen(text);
     if(len > 200) return;
-    const int pw = (int)len * 6 * scale;   /* 5 cols + 1 spacing per glyph */
-    const int ph = 8 * scale;              /* 7 rows + 1 */
 
-    if(!ras)
+    for(size_t i = 0; i < len; ++i)
     {
-        stbi_uc* px = MenuKit_RasterizeText(text, scale, cr, cg, cb, ca);
-        if(!px) return;
-        /* UploadRGBA takes ownership: it frees px on every path, success or
-           failure. Freeing it again here is a double free (scudo reports it as
-           "alignment too big", not "double free", because the chunk metadata is
-           already poisoned by the time of the second call). */
-        void* tex = MenuKit_UploadRGBA(px, pw, ph, &ras);
-        if(!tex || !ras) return;
-        IconEntry c;
-        memset(&c, 0, sizeof(c));
-        c.tex = tex;
-        c.ras = ras;
-        c.ok  = (*(void**)tex == ras);
-        s_canvasTextCache[key] = c;
-        logger->Info("MenuKit: canvas text '%s' rasterised (%dx%d, scale %d)", text, pw, ph, scale);
-    }
+        unsigned char c = (unsigned char)text[i];
+        if(c < 0x20 || c > 0x7e) c = '?';
+        const unsigned char* glyph = s_font5x7[c - 0x20];
+        for(int row = 0; row < 7; ++row)
+        {
+            int col = 0;
+            while(col < 5)
+            {
+                while(col < 5 && !((glyph[col] >> row) & 1)) ++col;
+                if(col >= 5) break;
+                const int start = col;
+                while(col < 5 && ((glyph[col] >> row) & 1)) ++col;
 
-    /* Record the quad for Canvas_Flush. Submitting here would be wrong twice
-       over: the engine's raster does not exist yet outside the 2D pass, and it
-       would drain the shape batch so everything the client drew after this
-       label would jump on top of it. */
-    if(s_canvasTextOpCount >= CANVAS_MAX_TEXT_OPS) { s_canvasTextLost++; return; }
-    CanvasTextOp& op = s_canvasTextOps[s_canvasTextOpCount++];
-    op.ras = ras;
-    const float texu[4] = { 0.0f, 1.0f, 1.0f, 0.0f };
-    const float texv[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
-    for(int i = 0; i < 4; ++i)
-    {
-        memset(&op.v[i], 0, sizeof(op.v[i]));
-        op.v[i].x  = x + (i & 1 ? (float)pw : 0.0f);
-        op.v[i].y  = y + (i & 2 ? (float)ph : 0.0f);
-        op.v[i].u  = texu[i];
-        op.v[i].v  = texv[i];
-        op.v[i].r  = 255; op.v[i].g = 255; op.v[i].b = 255; op.v[i].a = 255;
-        op.v[i].z  = 0.0f;
-        op.v[i].rhw = 1.0f;
+                const float rx = x + (float)(i * 6 * scale + start * scale);
+                const float ry = y + (float)(row * scale);
+                const float rw = (float)((col - start) * scale);
+                const float rh = (float)scale;
+                const float q0[6] = { rx,    ry,    rx+rw, ry,    rx+rw, ry+rh };
+                const float q1[6] = { rx,    ry,    rx,    ry+rh, rx+rw, ry+rh };
+                Canvas_Tri(q0, rgba);
+                Canvas_Tri(q1, rgba);
+            }
+        }
     }
 }
 
