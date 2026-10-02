@@ -15,8 +15,11 @@ typedef void (*MenuKit_TickCallback)(void* userdata);
    v10 changes: DrawText appended at the END of the struct. The canvas could
    draw shapes only, so a client could not put a word on screen without
    spending a native button on it - the exact limitation the canvas exists to
-   remove. DrawText rasterises a string with the embedded 5x7 font and caches
-   it per (text, scale, colour), so a static label costs one quad per frame.
+   remove. DrawText emits the string through the SHAPE path: one untextured quad
+   per horizontal run of lit pixels, in the same batch as the other primitives
+   (~14 quads per 5x7 glyph). Do NOT implement it as a per-glyph label texture:
+   that route was tried first and the sampler never sampled the uploaded
+   pixels, so the text was blank on device.
    v9 changes: GetPointer appended at the END of the struct. GetTap is a
    one-frame rising edge, so a client can see a tap but CANNOT follow a drag:
    a slider, a swipe or a long-press all need to know "is the finger still
