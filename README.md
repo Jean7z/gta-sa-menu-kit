@@ -5,15 +5,15 @@ nativos del juego. Los mods clientes dibujan botones que el propio motor
 procesa (update/draw/touch) — el framework solo los inyecta en el pool del juego.
 
 **Cero parches de bytes, cero offsets hardcodeados**: cada dirección se
-resuelve por símbolo vía IAML (`GetSym`). Compatible SA Android 2.10 arm64-v8a
-y 2.00 armeabi-v7a (verificado contra `libGTASA.so` reales vía `nm -D`).
+resuelve por símbolo vía IAML (`GetSym`). **Solo arm64-v8a**, porque los hooks
+están verificados contra el `libGTASA.so` de SA 2.10, que es arm64 puro.
 
 ## Arquitectura
 
-- `AML_PSDK_MenuKit64` / `AML_PSDK_MenuKit` — cargador del framework.
-  Resuelve `CTouchInterface::m_pWidgets`, `CWidgetButton::CWidgetButton(...)`
-  y `CTouchInterface::IsReleased(...)` por símbolo, inyecta el widget en el pool
-  del juego y expone `GetMenuAPI()` (API v8).
+- `AML_PSDK_MenuKit64` — cargador del framework. Resuelve `CTouchInterface::m_pWidgets`,
+  `CWidgetButton::CWidgetButton(...)` y `CTouchInterface::IsReleased(...)` por
+  símbolo, inyecta el widget en el pool del juego y expone `GetMenuAPI()`
+  (API v10).
 
 El framework usa el pool nativo del juego (190 slots). El widget inyectado
 participa de los loops nativos: el juego lo pinta, lo toca, y reporta el release
@@ -24,31 +24,42 @@ ejemplo al abrir/cerrar menús), migrando de slot si el juego lo ocupó.
 
 ```sh
 ~/android-ndk-r29/ndk-build
-# salida: libs/arm64-v8a/*.so y libs/armeabi-v7a/*.so
+# salida: libs/arm64-v8a/*.so  (arm64-v8a unicamente, ver Application.mk)
 ```
 
 ## Instalar
 
-1. Copia `libAML_PSDK_MenuKit64.so` a `Android/data/com.rockstargames.gtasa/files/psdk/` (arm64).
-2. Copia `libAML_PSDK_InternetRadio64.so` a la misma carpeta.
-3. Lanza el juego (AML carga los mods en orden de letras: `AML_PSDK_*`).
+Los `.so` van en la carpeta de mods de AML, que en el dispositivo es
+`Android/data/com.rockstargames.gtasa/mods/`. AML no carga de `files/psdk/`.
 
-> El framework debe cargarse ANTES que los clientes (orden alfabético de la
-> carpeta psdk: `MenuKit` < `InternetRadio`). Los clientes usan `MenuKit_GetAPI()`
-> que resuelve el framework en runtime y aborta limpio si no está.
+```sh
+adb push libs/arm64-v8a/libAML_PSDK_MenuKit64.so \
+  /sdcard/Android/data/com.rockstargames.gtasa/mods/
+adb push libs/arm64-v8a/libAML_PSDK_InternetRadio64.so \
+  /sdcard/Android/data/com.rockstargames.gtasa/mods/
+```
 
-## API v8 (`mod/menu-api.h`)
+En Android 11+ esa carpeta no se puede escribir con `adb push` ni desde un
+gestor de archivos: hace falta Shizuku o root (en Termux,
+`~/shizuku/rish -c "cp ... /storage/emulated/0/Android/data/.../mods/"`).
+
+1. Lanza el juego (AML carga los mods en orden de letras: `AML_PSDK_*`).
+2. `libAML_PSDK_MenuKit64.so` debe cargarse ANTES que los clientes
+   (`MenuKit` < `InternetRadio`); los clientes usan `MenuKit_GetAPI()`, que
+   resuelve el framework en runtime y aborta limpio si no está.
+
+## API v10 (`mod/menu-api.h`)
 
 ```c
 const MenuKitAPI* api = MenuKit_GetAPI(aml);   // NULL si el framework no está
-if(!api || api->version < 8) return;            // el cliente aborta limpio
+if(!api || api->version < 10) return;           // el cliente aborta limpio
 
 void* h = api->AddButton(0, "shoot", 320.0f, 380.0f, 60.0f, onRelease, ud, NULL);
 api->SetText(h, "RADIO");
 api->SetSize(h, 220.0f, 90.0f);                 // px reales: rompe el cuadrado
 api->SetVisible(h, 0);                           // sin coste de rebuild
 
-/* v8: lienzo 2D inmediato. Se dibuja cada frame desde el tick.
+/* Lienzo 2D inmediato. Se dibuja cada frame desde el tick.
    El reloj es del cliente: el framework no da tiempo porque cada cliente ya
    necesita el suyo para sus propios timers. */
 static unsigned NowMs(void)
@@ -66,6 +77,7 @@ static void Tick(void*)
 
     api->DrawRect(60, 60, 300, 100, 0x101820u | (a << 24), 1);   /* panel */
     api->DrawCircle(90 + (t % 200), 110, 12, 0xF97316FFu, 1, 24);
+    api->DrawText(60, 170, "MENUKIT V10", 2, 0x38BDF8FFu);       /* etiqueta */
 }
 api->SetTick(Tick, NULL);
 ```
@@ -83,8 +95,9 @@ api->SetTick(Tick, NULL);
 | `SetSize(handle, w, h)` | Redimensiona en **píxeles reales** manteniendo el centro que calculó el motor. `AddButton` solo puede construir cuadrados porque su `scale` es un único `float` uniforme; `SetSize` es la vía para romper ese límite. Ojo: habla px reales mientras `AddButton` habla virtuales, así que **no** le pases coordenadas del layout. |
 | `GetTap(x, y)` | `1` en el frame que **empieza** un tap (flanco de subida) y escribe la posición; `0` si no. Mantener el dedo es **un** tap, no uno por frame. Es la primitiva de "toca fuera para cerrar": AML no expone API de touch, así que un cliente solo podía reaccionar a taps sobre sus propios widgets. Devuelve `0` si no se resolvieron los globales. |
 | `GetRect(handle, l, t, r, b)` | Rect vivo en pantalla, en **píxeles reales**. Empareja con `GetTap`: el hit-test son cuatro comparaciones, sin arithmetic de la proyección. `0` = handle desconocido o widget aún sin construir (preguntar el próximo frame). |
+| `GetPointer(x, y, down)` | Estado **vivo** del puntero, consultable cada frame, en el mismo espacio de px reales que `GetTap`/`GetRect`. `GetTap` es un flanco de subida que desaparece al frame siguiente: sirve para un botón, no para un arrastre. Un slider, un swipe o un long-press necesitan "sigue el dedo abajo y dónde está **ahora**". `down=1` mientras hay dedo en la pantalla; `x`/`y` son válidos con `down=1` y **siguen** el arrastre. `0` si no se resolvieron los globales (degrada en vez de actuar sobre basura). |
 
-### v8: lienzo 2D inmediato
+### Lienzo 2D inmediato
 
 Retained (widgets) es solo la mitad de lo que necesitas. El lienzo es la otra:
 formas y alpha arbitrarias, sin gastar slots del pool.
@@ -97,6 +110,7 @@ formas y alpha arbitrarias, sin gastar slots del pool.
 | `DrawLine(x1,y1,x2,y2,rgba,width)` | Línea de grosor **real**: por debajo de 1 px va al raster directo; por encima se construye con dos triángulos, así que engordar una línea no cuesta un estado nuevo. |
 | `DrawPoly(xy,count,rgba,filled,closed)` | Polígono desde un array de pares `x,y`. `filled` usa abanico de triángulos: válido para convexos y formas estrelladas, **no** para contornos que se cruzan. `closed=0` deja la última arista abierta. |
 | `DrawCircle(cx,cy,r,rgba,filled,segments)` | Círculo, o anillo con `filled=0`. `segments` se limita a 3..128. |
+| `DrawText(x, y, text, scale, rgba)` | Texto en el lienzo, sin widget y sin textura de etiqueta. Todas las demás primitivas son solo formas, así que sin esto no había forma de poner una palabra en pantalla sin gastar un botón nativo. `x,y` es la esquina superior izquierda en px reales; `scale` es el multiplicador del glifo (1 = 5x7 crudo, 1..16); el avance es `6*scale` por carácter, así que el ancho es `len*6*scale` sin llamadas extra. Los caracteres fuera de `0x20..0x7E` salen como `'?'`. |
 | `SetDrawBlend(src,dst)` | Modo de blend (`rwBLEND*`). `-1` restaura el valor por defecto. |
 | `ResetDrawState()` | Vuelve al blend por defecto (src-alpha / inv-src-alpha). |
 
@@ -112,8 +126,14 @@ formas y alpha arbitrarias, sin gastar slots del pool.
   no funciona: corre antes de que exista ese contexto.
 - **Píxeles reales**, el mismo espacio que `GetRect`/`GetTap`. Sin proyecciones.
 - **`rgba` va empaquetado `0xRRGGBBAA`**, para animar un canal con un `<<`.
-- **Techo del lote: 2048 vértices / 3072 índices por frame.** Al llenarse se
+- **Techo del lote: 4096 vértices / 6144 índices por frame.** Al llenarse se
   descartan primitivas y se avisa por log una vez, en vez de romper el cliente.
+- **`DrawText` va al mismo lote que las formas**, un quad por run horizontal de
+  píxeles encendidos (~14 quads por glifo 5x7), no por textura. El orden de
+  dibujo es el orden de llamada, también respecto a las formas: un rectángulo
+  dibujado antes de una etiqueta queda debajo, uno dibujado después la tapa.
+  Los glifos van sobre fondo transparente, así que se ve lo que el cliente pintó
+  detrás.
 - **Z-order: el lienzo se dibuja ENCIMA de los widgets de AML.** Se midió en
   dispositivo, no se supone: con el flush al final de la pasada 2D el arte tapaba
   los paneles de AML, y moverlo antes —al principio de la pasada, o al punto
@@ -184,18 +204,31 @@ Cuatro reglas que hacen que un cliente funcione en lugar de romperse:
 
 ## Estado
 
-- v8 (actual): lienzo 2D inmediato — `DrawRect/Quad/Triangle/Line/Poly/Circle` con
-  alpha y blend por vértice, loteados a una sola llamada RW por frame y volcados
-  desde el hook de `Render2dStuff`; `GetTap` + `GetRect` en píxeles reales (v7)
-  habilitan "toca fuera para cerrar"; `SetSize` rompe el límite de widget
-  cuadrado; `SetAlpha`/`SetVisible` sobre widgets vivos; `SetTick` (v5) como
-  único callback por frame; `SetText` con fuente 5x7 embebida (v4), iconos
-  propios (v3), grupos de menú y `OpenMenu`/`CloseMenu` (v2), inyección por
-  símbolo, dispatch fiel. v8 verificado en dispositivo arm64-v8a (las cuatro
-  primitivas renderizan y animan).
+- v10 (actual): `DrawText` en el lienzo (v10), drawn como quads sin texturizar en
+  el mismo lote que las formas; `GetPointer` para arrastre en vivo (v9);
+  `GetTap` + `GetRect` en px reales (v7) habilitan "toca fuera para cerrar";
+  `SetSize` rompe el límite de widget cuadrado (v6); `SetAlpha`/`SetVisible`
+  sobre widgets vivos y `SetTick` (v5) como único callback por frame; `SetText`
+  con fuente 5x7 embebida (v4), iconos propios (v3), grupos de menú y
+  `OpenMenu`/`CloseMenu` (v2), inyección por símbolo, dispatch fiel.
+  v10 verificado en dispositivo arm64-v8a (texto legible, seek arrastrable con
+  la etiqueta siguiendo el dedo, formas y alpha animando).
+- **arm64-v8a únicamente.** Los hooks están verificados contra el `libGTASA.so`
+  de SA 2.10, que es arm64 puro. SA 2.00 trae arm7, pero esos offsets nunca se
+  comprobaron contra su binario: un build v7a sería una suposición que crashea
+  en runtime, así que no se genera.
 - Pendiente: `SetText` con fuente externa, limpieza de widgets huérfanos cuando
   el juego reconstruye el pool a mitad de una pulsación, y paquetes `.amlp` de
   ejemplo.
 - Techo conocido: el pool nativo es de 190 slots y el juego ocupa ~177, así que
-  quedan ~13 libres. El lote del lienzo va aparte (2048 vértices por frame) y no
-  consume pool: para formas y animation el pool dejó de ser el límite.
+  quedan ~13 libres. El lote del lienzo va aparte (4096 vértices por frame) y no
+  consume pool: para formas, texto y animación el pool dejó de ser el límite.
+
+## Una nota sobre la ruta de texto
+
+`DrawText` se implementó primero como quad texturizado (raster propio +
+`rwRENDERSTATETEXTURERASTER`) y en el dispositivo **no se veía nada**: el sampler
+enlaza el raster pero no llega a muestrear los píxeles subidos, así que el
+contenido era indefinido. La versión que funciona emite cada glifo como quads
+sin texturizar por la ruta de formas, que ya estaba probada. El camino texturizado
+se eliminó; queda esto escrito para que nadie lo "arregle" de vuelta.
