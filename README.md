@@ -71,7 +71,7 @@ static void Tick(void*)
 
     api->DrawRect(60, 60, 300, 100, 0x101820u | (a << 24), 1);   /* panel */
     api->DrawCircle(90 + (t % 200), 110, 12, 0xF97316FFu, 1, 24);
-    api->DrawText(60, 170, "MENUKIT V10", 2, 0x38BDF8FFu);       /* etiqueta */
+    api->DrawText(60, 170, "MENUKIT V11", 2, 0x38BDF8FFu);       /* etiqueta */
 }
 api->SetTick(Tick, NULL);
 ```
@@ -94,6 +94,7 @@ api->SetTick(Tick, NULL);
 | `GetTap(x, y)` | `1` en el frame que **empieza** un tap (flanco de subida) y escribe la posición; `0` si no. Mantener el dedo es un tap, no uno por frame. Es la primitiva de "toca fuera para cerrar": AML no expone API de touch, así que un cliente solo podía reaccionar a taps sobre sus propios widgets. Devuelve `0` si no se resolvieron los globales. |
 | `GetRect(handle, l, t, r, b)` | Rect vivo en pantalla, en píxeles reales. Empareja con `GetTap`: el hit-test son cuatro comparaciones, sin arithmetic de la proyección. `0` = handle desconocido o widget aún sin construir (preguntar el próximo frame). |
 | `GetPointer(x, y, down)` | Estado vivo del puntero, consultable cada frame, en el mismo espacio de px reales que `GetTap` y `GetRect`. `GetTap` es un flanco de subida que desaparece al frame siguiente: sirve para un botón, no para un arrastre. Un slider, un swipe o un long-press necesitan saber si el dedo sigue abajo y dónde está ahora. `down=1` mientras hay dedo en la pantalla. `0` si no se resolvieron los globales. |
+| `GetMenuUp()` | `1` si el juego tiene algún menú abierto, `0` si no, `-1` si no se encontró el símbolo. Existe porque con un menú abierto el dedo sigue siendo del juego, pero el lienzo del cliente ve ese mismo toque crudo, así que una UI dibujada encima se come los taps del menú. Un cliente con overlay debería ignorar entrada mientras devuelva `1`. Se resuelve por símbolo, sin offsets fijos. |
 
 ### Lienzo 2D inmediato
 
@@ -196,7 +197,7 @@ menú que no se ha abierto nunca se dibuja.
 `examples/internet-radio` es un reproductor de audio local (decodifica con
 `AMediaExtractor` y reproduce con OpenSL ES; no descarga nada) que monta su UI
 entera con el lienzo: panel con alpha que late, ecualizador, círculo, triángulo
-que gira, línea que engorda, barra de seek arrastrable y etiqueta `MENUKIT V10`.
+que gira, línea que engorda, barra de seek arrastrable y etiqueta `MENUKIT V11`.
 Compila con el mismo `ndk-build` y produce `libAML_PSDK_InternetRadio64.so`.
 
 ## Límites
@@ -206,7 +207,8 @@ Compila con el mismo `ndk-build` y produce `libAML_PSDK_InternetRadio64.so`.
   estado. El lote del lienzo va aparte y no consume pool.
 - Solo arm64-v8a. SA 2.00 trae arm7, pero esos offsets nunca se comprobaron
   contra su binario: un build v7a crashea en runtime, así que no se genera.
-- v10 verificado en dispositivo arm64-v8a: texto legible, seek arrastrable con la
-  etiqueta siguiendo el dedo, formas y alpha animando.
+- v11 verificado en dispositivo arm64-v8a: texto legible, seek arrastrable con la
+  etiqueta siguiendo el dedo, formas y alpha animando, y `GetMenuUp` haciendo que el
+  launcher no se coma el toque con el que se cierra el mapa.
 - Pendiente: `SetText` con fuente externa y limpieza de widgets huérfanos cuando
   el juego reconstruye el pool a mitad de una pulsación.
