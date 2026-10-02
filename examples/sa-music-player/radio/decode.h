@@ -1,4 +1,4 @@
-/* Internet Radio mod - MP3 decoder (minimp3 wrapper), streaming-friendly.
+/* SA Music Player mod - MP3 decoder (minimp3 wrapper), streaming-friendly.
    Slice 1: decoder verificado en host (mismo .c compila con NDK). */
 #ifndef RADIO_DECODE_H
 #define RADIO_DECODE_H

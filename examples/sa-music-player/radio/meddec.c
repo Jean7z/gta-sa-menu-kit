@@ -1,4 +1,4 @@
-/* Internet Radio mod - decoder de fichero local (ver meddec.h).
+/* SA Music Player mod - decoder de fichero local (ver meddec.h).
    Threads: se usa desde el hilo de decode del sink. No es reentrante por
    instancia (un solo hilo por radio_meddec), que es justo lo que hace falta. */
 #include "meddec.h"

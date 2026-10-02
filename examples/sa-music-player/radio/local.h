@@ -1,4 +1,4 @@
-/* Internet Radio mod - reproductor local de una carpeta de musica.
+/* SA Music Player mod - reproductor local de una carpeta de musica.
    Sustituye a la red como fuente: en vez de un stream MP3 de una estacion, se
    recorren los ficheros de un directorio y los decodifica el propio telefono
    (radio/meddec.c), asi que el mod reproduce lo que el dispositivo admita en

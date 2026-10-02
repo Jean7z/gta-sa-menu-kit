@@ -1,4 +1,4 @@
-/* Internet Radio mod - ring buffer (see ring.h). */
+/* SA Music Player mod - ring buffer (see ring.h). */
 #include "ring.h"
 
 #include <stdlib.h>

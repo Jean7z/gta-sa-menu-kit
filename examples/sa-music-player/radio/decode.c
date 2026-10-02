@@ -1,4 +1,4 @@
-/* Internet Radio mod - MP3 decoder (minimp3 wrapper), streaming-friendly.
+/* SA Music Player mod - MP3 decoder (minimp3 wrapper), streaming-friendly.
    minimp3 decodifica UN frame por llamada. Su slow path hace
    memset(dec,0) (destruye el bit reservoir L3 + filtro QMF) cuando el buffer
    no contiene un frame completo + header del siguiente; eso es PERDIDA de

@@ -1,4 +1,4 @@
-/* Internet Radio - reproductor local de musica, cliente de la API v10 de SA Menu Kit.
+/* SA Music Player - reproductor local de musica, cliente de la API v11 de SA Menu Kit.
    El boton recorre los ficheros de una carpeta y los decodifica el propio
    telefono (radio/meddec.c: AMediaExtractor + AMediaCodec), asi que suenan flac,
    m4a, opus, ogg... y no solo mp3. La eleccion de formato la hace el
@@ -26,7 +26,7 @@
 #include <ctime>
 #include <pthread.h>
 
-MYMODCFG(net.psdk.samod.internetradio, Internet Radio, 0.4, Jean7z)
+MYMODCFG(net.psdk.samod.samusicplayer, SA Music Player, 0.4, Jean7z)
 
 /* Carpeta de musica. Va en el external files dir DEL JUEGO, asi que el proceso
    puede leerla sin pedir ningun permiso: en Android 11+ el acceso al
@@ -173,7 +173,7 @@ static void RadioLog(void* ctx, const char* fmt, ...)
    carpeta, y los datos estan disponibles sin hilo ni polling extra. */
 static void RadioLogStats(void)
 {
-    logger->Info("InternetRadio: fin -> %d temas, %lld muestras, %d underruns, %d cambios de formato",
+    logger->Info("SAMusicPlayer: fin -> %d temas, %lld muestras, %d underruns, %d cambios de formato",
                  radio_local_tracks(s_local), radio_local_samples(s_local),
                  radio_local_underruns(s_local), radio_local_fmt_changes(s_local));
 }
@@ -247,7 +247,7 @@ static void ProbeScreen(void)
             s_screenH = (t + 50.0f) * 2.0f;
             s_api->RemoveWidget(s_probe);
             s_probe = NULL;
-            logger->Info("InternetRadio: render medido %.0fx%.0f px", s_screenW, s_screenH);
+            logger->Info("SAMusicPlayer: render medido %.0fx%.0f px", s_screenW, s_screenH);
             return;
         }
         if(now - s_probeAt < 1500u) return;
@@ -256,7 +256,7 @@ static void ProbeScreen(void)
     s_screenW = 1600.0f;
     s_screenH = 720.0f;
     if(s_probe) { s_api->RemoveWidget(s_probe); s_probe = NULL; }
-    logger->Error("InternetRadio: la sonda no dio rect; asumo %.0fx%.0f",
+    logger->Error("SAMusicPlayer: la sonda no dio rect; asumo %.0fx%.0f",
                   s_screenW, s_screenH);
 }
 
@@ -663,11 +663,11 @@ static void OnTrackChanged(void* ctx, const char* name, const char* path)
     rc = radio_cover_extract(aml->GetJNIEnvironment(), path, RADIO_COVER_DIR,
                              cover, sizeof cover, title, sizeof title);
     if(rc < 0)
-        logger->Error("InternetRadio: sin API de Java para la portada de %s", name);
+        logger->Error("SAMusicPlayer: sin API de Java para la portada de %s", name);
     else if(!cover[0])
-        logger->Info("InternetRadio: %s no trae portada", name);
+        logger->Info("SAMusicPlayer: %s no trae portada", name);
     else
-        logger->Info("InternetRadio: portada cacheada %s", cover);
+        logger->Info("SAMusicPlayer: portada cacheada %s", cover);
 
     SetDisplayName(title, name);
 }
@@ -678,12 +678,12 @@ static int RadioStart(void)
     if(!s_local) return -1;
     if(radio_local_start(s_local) != 0)
     {
-        logger->Error("InternetRadio: no se pudo arrancar la reproduccion");
+        logger->Error("SAMusicPlayer: no se pudo arrancar la reproduccion");
         return -1;
     }
     s_radioOn = true;
     s_paused  = false;
-    logger->Info("InternetRadio: ON -> %s", RADIO_MUSIC_DIR);
+    logger->Info("SAMusicPlayer: ON -> %s", RADIO_MUSIC_DIR);
     return 0;
 }
 
@@ -697,7 +697,7 @@ static void RadioSetPaused(int paused)
     radio_local_pause(s_local, paused ? 1 : 0);
     s_paused = (paused != 0);
     s_flow = 0.0f;               /* el medidor arranca plano al reanudar */
-    logger->Info("InternetRadio: %s", paused ? "PAUSE" : "RESUME");
+    logger->Info("SAMusicPlayer: %s", paused ? "PAUSE" : "RESUME");
 }
 
 static void RadioStop(void)
@@ -708,24 +708,25 @@ static void RadioStop(void)
     s_radioOn = false;
     s_paused  = false;
     s_flow = 0.0f;
-    logger->Info("InternetRadio: OFF");
+    logger->Info("SAMusicPlayer: OFF");
 }
 
 ON_MOD_LOAD()
 {
-    logger->SetTag("InternetRadio");
+    logger->SetTag("SAMusicPlayer");
 
     s_api = MenuKit_GetAPI(aml);
     if(!s_api)
     {
-        logger->Error("InternetRadio: MenuKit framework not loaded (load AML_PSDK_MenuKit64 first)");
+        logger->Error("SAMusicPlayer: MenuKit framework not loaded (load AML_PSDK_MenuKit64 first)");
         return;
     }
-    /* La UI es lienzo puro con DrawText y GetPointer: v10 es el minimo. */
-    if(s_api->version < 10)
+    /* La UI es lienzo puro con DrawText y GetPointer, y GetMenuUp evita que el
+       launcher se coma el toque de cerrar el mapa: v11 es el minimo. */
+    if(s_api->version < MENUKIT_API_VERSION)
     {
-        logger->Error("InternetRadio: MenuKit API v10 required (got v%u) - actualiza AML_PSDK_MenuKit64",
-                      s_api->version);
+        logger->Error("SAMusicPlayer: MenuKit API v%u required (got v%u) - actualiza AML_PSDK_MenuKit64",
+                      MENUKIT_API_VERSION, s_api->version);
         s_api = NULL;
         return;
     }
@@ -733,7 +734,7 @@ ON_MOD_LOAD()
     s_local = radio_local_new(RADIO_MUSIC_DIR);
     if(!s_local)
     {
-        logger->Error("InternetRadio: no hay musica en %s", RADIO_MUSIC_DIR);
+        logger->Error("SAMusicPlayer: no hay musica en %s", RADIO_MUSIC_DIR);
         return;
     }
     radio_local_set_log(s_local, RadioLog, NULL);
@@ -750,12 +751,12 @@ ON_MOD_LOAD()
     }
     else
     {
-        logger->Error("InternetRadio: sin slots para la sonda de pantalla");
+        logger->Error("SAMusicPlayer: sin slots para la sonda de pantalla");
     }
 
     s_api->SetTick(OnTick, NULL);
 
-    logger->Info("InternetRadio: UI de lienzo lista (%d pistas en %s)",
+    logger->Info("SAMusicPlayer: UI de lienzo lista (%d pistas en %s)",
                  radio_local_count(s_local), RADIO_MUSIC_DIR);
 }
 
@@ -766,5 +767,5 @@ ON_MOD_UNLOAD()
     RadioStop();
     radio_local_free(s_local);
     s_local = NULL;
-    logger->Info("InternetRadio: unload, musica parada");
+    logger->Info("SAMusicPlayer: unload, musica parada");
 }

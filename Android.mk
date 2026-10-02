@@ -14,21 +14,21 @@ LOCAL_LDFLAGS := -Wl,--gc-sections
 LOCAL_LDLIBS := -llog
 include $(BUILD_SHARED_LIBRARY)
 
-# ---- Internet Radio (reproductor local: decodifica con la plataforma) ----
+# ---- SA Music Player (reproductor local: decodifica con la plataforma) ----
 include $(CLEAR_VARS)
-LOCAL_MODULE := AML_PSDK_InternetRadio64
+LOCAL_MODULE := AML_PSDK_SAMusicPlayer64
 LOCAL_CPP_EXTENSION := .cpp .cc
 LOCAL_C_INCLUDES := $(LOCAL_PATH) $(LOCAL_PATH)/psdk $(LOCAL_PATH)/mod \
-                   $(LOCAL_PATH)/examples/internet-radio
-LOCAL_SRC_FILES := examples/internet-radio/main.cpp \
-                   examples/internet-radio/radio/decode.c \
-                   examples/internet-radio/radio/ring.c \
-                   examples/internet-radio/radio/sink.c \
-                   examples/internet-radio/radio/sink_opensl.c \
-                   examples/internet-radio/radio/meddec.c \
-                   examples/internet-radio/radio/playlist.c \
-                   examples/internet-radio/radio/local.c \
-                   examples/internet-radio/radio/cover.c \
+                   $(LOCAL_PATH)/examples/sa-music-player
+LOCAL_SRC_FILES := examples/sa-music-player/main.cpp \
+                   examples/sa-music-player/radio/decode.c \
+                   examples/sa-music-player/radio/ring.c \
+                   examples/sa-music-player/radio/sink.c \
+                   examples/sa-music-player/radio/sink_opensl.c \
+                   examples/sa-music-player/radio/meddec.c \
+                   examples/sa-music-player/radio/playlist.c \
+                   examples/sa-music-player/radio/local.c \
+                   examples/sa-music-player/radio/cover.c \
                    mod/logger.cpp mod/config.cpp
 LOCAL_CXXFLAGS := -Os -ffunction-sections -fdata-sections -DNDEBUG -std=c++17
 LOCAL_LDFLAGS := -Wl,--gc-sections

@@ -1,4 +1,4 @@
-/* Internet Radio mod - contrato del backend de dispositivo (ver sink.c).
+/* SA Music Player mod - contrato del backend de dispositivo (ver sink.c).
    Android : sink_opensl.c (OpenSL ES + SLAndroidBufferQueueItf, API 21+).
    Host    : test_sink.c, que simula un dispositivo que consume a ritmo real.
    Solo hay una implementacion por plataforma: el sink.c no sabe de OpenSL. */

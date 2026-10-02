@@ -1,4 +1,4 @@
-/* Internet Radio mod - sink de audio (slice C).
+/* SA Music Player mod - sink de audio (slice C).
    Parte portable: el hilo de decode y el ring PCM viven aqui; el dispositivo
    real (OpenSL ES en Android) es un backend aparte (sink_dev.h). Asi el
    ritmo y la backpressure se verifican en host con un dispositivo simulado.

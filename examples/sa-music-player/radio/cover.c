@@ -1,4 +1,4 @@
-/* Internet Radio mod - portada y titulo de una pista (ver cover.h).
+/* SA Music Player mod - portada y titulo de una pista (ver cover.h).
    MediaMetadataRetriever es la clase de Java que trae el sistema: ya sabe leer
    la caratula de un FLAC, un MP3 con ID3v2 o un M4A con covr, y no hay que
    vendorizar ni un parser de contenedor aqui.

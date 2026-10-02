@@ -1,4 +1,4 @@
-/* Internet Radio mod - sink de audio portable (ver sink.h).
+/* SA Music Player mod - sink de audio portable (ver sink.h).
    Hilo de decode: MP3 (ring de red) -> decoder -> PCM (ring jitter).
    El ritmo lo impone el consumidor, no este modulo: cuando el ring PCM se
    llena, radio_ring_write bloquea, el hilo deja de tirar de red y la

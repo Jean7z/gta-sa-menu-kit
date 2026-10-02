@@ -1,4 +1,4 @@
-/* Internet Radio mod - bounded byte queue between the network thread
+/* SA Music Player mod - bounded byte queue between the network thread
    (producer) and the audio/decoder side (consumer).
    Slice B1: minimum viable SPSC ring - one mutex, two condvars, monotonic
    head/tail counters (no wrap ambiguity, no index arithmetic tricks). */

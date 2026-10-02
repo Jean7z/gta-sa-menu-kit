@@ -1,4 +1,4 @@
-/* Internet Radio mod - decoder de fichero local con la plataforma Android
+/* SA Music Player mod - decoder de fichero local con la plataforma Android
    (AMediaExtractor + AMediaCodec, libmediandk, API 21+).
 
    Por que esto y no un decodificador propio: el telefono ya trae decodificadores

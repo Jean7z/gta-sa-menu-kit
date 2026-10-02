@@ -4,9 +4,9 @@
 
 # Binarios de host tests: se ignoran por patrón, no uno por uno, para que la
 # lista no quede vieja al añadir o borrar un test. Los .c SI se versionan.
-examples/internet-radio/radio/host_test/test_*
-!examples/internet-radio/radio/host_test/test_*.c
-!examples/internet-radio/radio/host_test/test_*.h
+examples/sa-music-player/radio/host_test/test_*
+!examples/sa-music-player/radio/host_test/test_*.c
+!examples/sa-music-player/radio/host_test/test_*.h
 
 # Artefactos de prueba: el MP3 es material con copyright de terceros
 test.mp3

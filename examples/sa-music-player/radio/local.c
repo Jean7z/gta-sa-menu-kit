@@ -1,4 +1,4 @@
-/* Internet Radio mod - hilo del reproductor local (ver local.h). */
+/* SA Music Player mod - hilo del reproductor local (ver local.h). */
 #include "local.h"
 #include "meddec.h"
 

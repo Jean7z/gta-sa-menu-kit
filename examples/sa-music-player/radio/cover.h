@@ -1,4 +1,4 @@
-/* Internet Radio mod - portada de la cancion y titulo por JNI (ver cover.h). */
+/* SA Music Player mod - portada de la cancion y titulo por JNI (ver cover.h). */
 #ifndef RADIO_COVER_H
 #define RADIO_COVER_H
 

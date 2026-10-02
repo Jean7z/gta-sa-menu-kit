@@ -1,4 +1,4 @@
-/* Internet Radio mod - lista de reproduccion por directorio (ver playlist.h). */
+/* SA Music Player mod - lista de reproduccion por directorio (ver playlist.h). */
 #include "playlist.h"
 
 #include <dirent.h>

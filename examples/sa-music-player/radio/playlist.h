@@ -1,4 +1,4 @@
-/* Internet Radio mod - lista de reproduccion por directorio (ver playlist.h). */
+/* SA Music Player mod - lista de reproduccion por directorio (ver playlist.h). */
 #ifndef RADIO_PLAYLIST_H
 #define RADIO_PLAYLIST_H
 

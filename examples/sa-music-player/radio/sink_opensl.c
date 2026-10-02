@@ -1,4 +1,4 @@
-/* Internet Radio mod - backend OpenSL ES del sink (Android, API 24).
+/* SA Music Player mod - backend OpenSL ES del sink (Android, API 24).
    Aqui no hay nada de ritmo: OpenSL ES ya consume a velocidad de hardware.
    El unico trabajo es copiar el PCM del ring al buffer que toca; si aun no
    hay PCM, radio_sink_pull() mete silencio y cuenta el underrun.
