@@ -43,7 +43,7 @@ MYMODCFG(net.psdk.samod.internetradio, Internet Radio, 0.4, Jean7z)
 
 /* --- UI ---------------------------------------------------------------------
    TODO se dibuja con el lienzo 2D, en PIXELES REALES (1600x720 medidos en
-   dispositivo). No hay widgets nativos: los tres controles son hit-test propio
+   dispositivo). No hay widgets nativos: los controles son hit-test propio
    sobre el puntero, que es lo unico que permite el lienzo inmediato.
 
    Lo que NO se puede hacer aqui, y por que:
@@ -58,9 +58,11 @@ MYMODCFG(net.psdk.samod.internetradio, Internet Radio, 0.4, Jean7z)
      pero no llega a muestrear los pixeles subidos, asi que salia en blanco. El
      texto va por la ruta de quads sin texturizar (DrawText), que ya funciona.
 
-   - Bordes redondeados con un fan de perimetro: parpadea. Por eso el relleno es
-     4 circulos de esquina + 3 rectangulos (piezas convexas, sin strip) y el
-     borde son 4 arcos stroked cerrados. Es la combinacion que no titila.
+   - Bordes redondeados con un fan de perimetro: parpadea. Por eso el relleno son
+     4 cuartos de disco + 3 rectangulos (piezas convexas, sin strip) y el borde
+     son 4 arcos de 90 como polilinea abierta + 4 lados rectos. No vale
+     DrawCircle, que solo sabe dibujar el circulo COMPLETO: al trazar las 4
+     esquinas aparecia tambien el arco interior de cada una.
 
    - Tamano de pantalla: OS_ScreenGetWidth() miente (reporto 1024x600 con un
      render real de 1600x720), asi que no se puede usar para colocar la tarjeta.
@@ -74,6 +76,20 @@ MYMODCFG(net.psdk.samod.internetradio, Internet Radio, 0.4, Jean7z)
 #define BTN_R            22.0f   /* radio visual de prev/next */
 #define BTN_R_PLAY       30.0f   /* el play es el primario, se ve mas grande */
 #define BTN_TOUCH_PAD     8.0f   /* margen extra de hit-test (dedo, no raton) */
+
+/* Lanzador replegado. Con la tarjeta cerrada solo se ve este boton-redondo, una
+   nota musical que abre el reproductor. Va abajo al centro, justo donde aparece
+   la tarjeta, para que al abrir y cerrar no salte de un sitio a otro. El color
+   dice si esta sonando algo, para que no haya que abrirlo a mirar. */
+#define ICO_R           38.0f   /* radio del boton */
+#define ICO_MARGIN      40.0f   /* margen respecto al borde de la pantalla */
+/* Fundido por inactividad. Pasa un rato sin tocar nada y el icono se atenua hasta
+   un piso: se intuye que sigue ahi sin robar sitio a la partida, pero nunca llega
+   a desaparecer (si desaparece, no se sabria donde tocar para despertarlo). Al
+   pulsarlo vuelve a su aspecto. */
+#define ICO_FADE_DELAY 6000.0f  /* ms sin presion antes de empezar a apagarse */
+#define ICO_FADE_TIME   900.0f  /* ms que dura el fundido */
+#define ICO_FADE_MIN    0.38f   /* piso de opacidad */
 
 #define R_BG          0xE60B1220u   /* tarjeta, casi opaca */
 #define R_EDGE        0xFF1E3A5Fu   /* borde de la tarjeta */
@@ -103,7 +119,14 @@ static uint64_t s_probeAt  = 0;
 
 /* Geometria de la tarjeta del frame actual (la escribe LayoutCard). */
 static float s_cardX, s_cardY, s_bxPrev, s_bxPlay, s_bxNext, s_bY;
-static int   s_press = 0;      /* boton pulsado: 1 prev, 2 play, 3 next */
+/* Geometria del lanzador replegado y del boton que repliega la tarjeta. Se
+   calculan siempre, aunque solo se dibujen cuando toca: el hit-test necesita las
+   coordenadas igual que el dibujo. */
+static float s_icoX, s_icoY, s_closeX, s_closeY;
+static bool  s_cardOpen = false;   /* la tarjeta arranca replegada */
+static uint64_t s_idleAt = 0;      /* ms de la ultima presion sobre nuestra UI */
+static uint64_t s_tickPrev = 0;    /* ms del tick anterior, para detectar parones */
+static int   s_press = 0;      /* boton pulsado: ver B_* */
 static int   s_wasDown = 0;    /* flanco de bajada del puntero */
 /* Nivel del medidor. El delta de muestras se promedia en una ventana de 200 ms en
    lugar de mirar el frame: el decodificador entrega un chunk por cada ~186 ms de
@@ -120,6 +143,8 @@ static uint64_t s_winAt = 0;         /* ms en que se abrio la ventana */
 #define B_BTN_PREV 1
 #define B_BTN_PLAY 2
 #define B_BTN_NEXT 3
+#define B_BTN_CLOSE 4    /* repliega la tarjeta */
+#define B_ICO_OPEN  5    /* el icono de nota despliega la tarjeta */
 
 /* Reloj de milisegundos. El unico con el que se puede animar: AML no da hook por
    frame (solo PRELOAD/LOAD/UNLOAD/CRASH), asi que el pump de CGame_Process es
@@ -275,7 +300,7 @@ static int ArcPts(float cx, float cy, float r, float a0, float* xy)
 static void FillQuarterDisc(float cx, float cy, float r, float a0, unsigned int c)
 {
     float xy[2 * (ARC_SEGS + 2)];
-    int i, n = 0;
+    int n = 0;
     xy[n * 2] = cx; xy[n * 2 + 1] = cy; ++n;              /* centro: ancla del fan */
     n += ArcPts(cx, cy, r, a0, xy + n * 2);
     s_api->DrawPoly(xy, n, c, 1, 1);
@@ -354,13 +379,43 @@ static void DrawSkipGlyph(float cx, float cy, float r, int dir, unsigned int c)
     s_api->DrawTriangle(a2, cy - h, b2, cy, a2, cy + h, c, 1);
 }
 
+/* Chevron de dos segmentos, la convencion de "sube/baja": en el lanzador es "abre
+   la tarjeta" y en la tarjeta es "repliegala". up = 1 apunta arriba. */
+static void DrawChevronGlyph(float cx, float cy, float r, int up, unsigned int c)
+{
+    const float d = r * 0.60f;
+    const float s = (float)(up ? 1 : -1);
+    s_api->DrawLine(cx - d, cy + d * s, cx, cy - d * s, c, 1.0f);
+    s_api->DrawLine(cx,     cy - d * s, cx + d, cy + d * s, c, 1.0f);
+}
+
+/* Nota musical: dos corcheas con la barra encima. Dos cabezas (circulo relleno),
+   dos plumas y la barra (lineas). Aqui DrawCircle si sirve relleno plano, que es
+   justo lo que se busca; el problema del circulo completo era del BORDE. */
+static void DrawNoteGlyph(float cx, float cy, float r, unsigned int c)
+{
+    const float hw = r * 0.30f;        /* radio de cabeza */
+    const float dx = r * 0.40f;        /* separacion entre cabezas */
+    const float ax = cx - dx, bx = cx + dx;
+    const float by = cy + r * 0.50f;    /* linea donde viven las cabezas */
+    s_api->DrawCircle(ax, by, hw, c, 1, 16);
+    s_api->DrawCircle(bx, by, hw, c, 1, 16);
+    s_api->DrawLine(ax, by - hw * 0.5f, ax, cy - r * 0.70f, c, 1.0f);
+    s_api->DrawLine(bx, by - hw * 0.5f, bx, cy - r * 1.00f, c, 1.0f);
+    s_api->DrawLine(ax, cy - r * 0.70f, bx, cy - r * 1.00f, c, 1.0f);
+}
+
 static int  RadioStart(void);
 static void RadioStop(void);
 static void RadioSetPaused(int paused);
 
 static float HitRadius(int id)
 {
-    return (id == B_BTN_PLAY ? BTN_R_PLAY : BTN_R) + BTN_TOUCH_PAD;
+    /* Cada boton tiene su radio visual y el acierto se amplia un poco, porque lo
+       que toca es un dedo y no un raton. */
+    if(id == B_BTN_PLAY) return BTN_R_PLAY + BTN_TOUCH_PAD;
+    if(id == B_ICO_OPEN)  return ICO_R + BTN_TOUCH_PAD;
+    return BTN_R + BTN_TOUCH_PAD;
 }
 
 /* Un rectangulo de toque alrededor del centro. Cuadrado y no circulo porque es lo
@@ -380,27 +435,82 @@ static void LayoutCard(void)
     s_bxPlay = cx;
     s_bxNext = cx + BTN_GAP;
     s_bY     = s_cardY + CARD_H - 48.0f;
+    /* El chevron de replegar va al extremo derecho de la fila de botones: a la
+       derecha de "next" sobra sitio de sobra, y la esquina de arriba esta
+       ocupada por el titulo a la izquierda y el estado a la derecha. */
+    s_closeX = s_cardX + CARD_W - CARD_PAD - 14.0f;
+    s_closeY = s_bY;
+
+    /* Lanzador abajo al centro: es donde sale la tarjeta, asi que abrir y cerrar
+       no salta de un sitio a otro, y queda a tiro de los dos pulgares. */
+    s_icoX = s_screenW * 0.5f;
+    s_icoY = s_screenH - ICO_MARGIN - ICO_R;
 }
 
 /* Hit-test y accion. El flanco lo da el estado ANTERIOR del puntero: sin el, un
    dedo que se queda apoyado sobre el play lo alternaria en cada frame. */
-static void HandleInput(void)
+/* Cuanto se ve el lanzador ahora mismo: 1.0 recien tocado, bajando hasta
+   ICO_FADE_MIN pasado ICO_FADE_DELAY sin que se toque nada. */
+static float IconFade(uint64_t now)
+{
+    float t;
+    if(now <= s_idleAt || now - s_idleAt <= (uint64_t)ICO_FADE_DELAY) return 1.0f;
+    t = (float)(now - s_idleAt - (uint64_t)ICO_FADE_DELAY) / ICO_FADE_TIME;
+    if(t > 1.0f) t = 1.0f;
+    return 1.0f - (1.0f - ICO_FADE_MIN) * t;
+}
+
+static void HandleInput(uint64_t now)
 {
     float px = 0.0f, py = 0.0f;
     int down = 0, id = 0;
 
     if(!s_api->GetPointer(&px, &py, &down)) { s_wasDown = down; s_press = 0; return; }
 
-    if(down)
+    /* Con el menu del juego abierto el dedo es suyo, no nuestro. El raw touch
+       sigue llegando aqui mientras el mapa esta abierto, asi que sin esta puerta
+       el toque con el que se cierra el mapa se lee como un tap en nuestro icono
+       y nos abre el reproductor. GetMenuUp lee la pila de screens del propio
+       juego, asi que es su definicion de "ocupado", no una heuristica.
+
+       Salimos sin interpretar nada y resincronizamos el flanco con el estado
+       real del dedo, para que el toque de cierre no quede pendiente. */
+    if(s_api->GetMenuUp && s_api->GetMenuUp() == 1)
     {
-        if     (HitTest(px, py, s_bxPrev, s_bY, B_BTN_PREV)) id = B_BTN_PREV;
-        else if(HitTest(px, py, s_bxPlay, s_bY, B_BTN_PLAY)) id = B_BTN_PLAY;
-        else if(HitTest(px, py, s_bxNext, s_bY, B_BTN_NEXT)) id = B_BTN_NEXT;
+        s_wasDown = down;
+        s_press = 0;
+        s_tickPrev = now;
+        return;
     }
 
-    if(down && !s_wasDown)
+    /* Respaldo para un framework viejo que no exponga GetMenuUp (-1): si el pump
+       dejo de correr, el juego abrio su propia UI mientras tanto y el flanco que
+       vemos no es nuestro. */
+    if(s_api->GetMenuUp && s_api->GetMenuUp() < 0
+       && now > s_tickPrev && now - s_tickPrev > 250u) s_wasDown = 1;
+    s_tickPrev = now;
+
+    if(down)
     {
-        if(id == B_BTN_PREV)      radio_local_skip(s_local, -1);
+        if(s_cardOpen)
+        {
+            if     (HitTest(px, py, s_bxPrev, s_bY,     B_BTN_PREV))  id = B_BTN_PREV;
+            else if(HitTest(px, py, s_bxPlay, s_bY,     B_BTN_PLAY))  id = B_BTN_PLAY;
+            else if(HitTest(px, py, s_bxNext, s_bY,     B_BTN_NEXT))  id = B_BTN_NEXT;
+            else if(HitTest(px, py, s_closeX, s_closeY, B_BTN_CLOSE)) id = B_BTN_CLOSE;
+        }
+        else if(HitTest(px, py, s_icoX, s_icoY, B_ICO_OPEN)) id = B_ICO_OPEN;
+    }
+
+    if(down && !s_wasDown && id)
+    {
+        /* Cualquier toque sobre nuestra UI reinicia el fundido. Un toque abre
+           siempre, este o no apagado: pedir dos golpes para lo mismo es
+           engorroso. El apagado es solo estetica, no una puerta. */
+        s_idleAt = now;
+        if(id == B_BTN_CLOSE)     s_cardOpen = false;
+        else if(id == B_ICO_OPEN) s_cardOpen = true;
+        else if(id == B_BTN_PREV) radio_local_skip(s_local, -1);
         else if(id == B_BTN_NEXT) radio_local_skip(s_local, +1);
         else if(id == B_BTN_PLAY)
         {
@@ -468,6 +578,30 @@ static void DrawCard(uint64_t now)
     DrawSkipGlyph(s_bxNext, s_bY, BTN_R, +1, s_press == B_BTN_NEXT ? R_ACCENT : R_DIM);
     if(s_radioOn && !s_paused) DrawPauseGlyph(s_bxPlay, s_bY, BTN_R_PLAY, R_ACCENT);
     else                      DrawPlayGlyph(s_bxPlay, s_bY, BTN_R_PLAY, R_TEXT);
+    DrawChevronGlyph(s_closeX, s_closeY, BTN_R, 0, s_press == B_BTN_CLOSE ? R_ACCENT : R_DIM);
+}
+
+/* Modula el canal alpha de un color 0xAARRGGBB. El fundido del lanzador es lo
+   unico que lo necesita; el resto de la UI dibuja opaca. */
+static unsigned int FadeAlpha(unsigned int c, float k)
+{
+    const unsigned int a = (unsigned int)((float)((c >> 24) & 0xFFu) * k);
+    return (a << 24) | (c & 0x00FFFFFFu);
+}
+
+/* Lanzador replegado. Con la tarjeta cerrada solo se ve esto: un boton-redondo
+   con una nota musical que la abre. El borde va con DrawCircle a proposito: aqui
+   si queremos el circulo COMPLETO, que es el anillo del boton. */
+static void DrawLauncher(uint64_t now)
+{
+    /* Aleta: color de acento mientras suena, apagado si esta parado. Asi el
+       icono dice si hay musica sin abrir el reproductor. */
+    const float k = IconFade(now);
+    const unsigned int c = (s_radioOn && !s_paused) ? R_ACCENT : R_DIM;
+    s_api->DrawCircle(s_icoX, s_icoY, ICO_R, FadeAlpha(R_BG, k), 1, 40);
+    s_api->DrawCircle(s_icoX, s_icoY, ICO_R, FadeAlpha(R_EDGE, k), 0, 40);
+    DrawNoteGlyph(s_icoX, s_icoY, ICO_R * 0.52f,
+                  FadeAlpha(s_press == B_ICO_OPEN ? R_TEXT : c, k));
 }
 
 static void OnTick(void* userdata)
@@ -482,7 +616,7 @@ static void OnTick(void* userdata)
     if(s_screenW <= 0.0f) return;   /* todavia no se sabe cuanto mide la pantalla */
 
     LayoutCard();
-    HandleInput();
+    HandleInput(now);
 
     /* Actividad real del audio: el total de muestras solo crece si el hilo de
        reproduccion esta escribiendo, asi que su crecimiento es la senal de "suena".
@@ -503,7 +637,8 @@ static void OnTick(void* userdata)
     if(s_flow < 0.0f) s_flow = 0.0f;
     if(s_flow > 1.0f) s_flow = 1.0f;
 
-    DrawCard(now);
+    if(s_cardOpen) DrawCard(now);
+    else           DrawLauncher(now);
 }
 
 /* HILO DE AUDIO. Corren en el hilo de reproduccion, justo al abrir cada pista,

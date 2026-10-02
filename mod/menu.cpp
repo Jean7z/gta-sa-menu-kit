@@ -268,6 +268,13 @@ static float s_screenH = 448.0f;
    non-static member, so it would need one; the statics need nothing). */
 static bool*  s_pTouchDown  = NULL;   /* CTouchInterface::m_bTouchDown */
 static float* s_pTouchPos   = NULL;   /* CTouchInterface::m_vecCachedPos, {x, y} */
+/* gMobileMenu: the game's own MobileMenu singleton, 208 bytes. Reverse
+   engineered in libGTASA_device.so (see mod/menu-api.h for the layout): it
+   owns the stack of menu screens, and the engine gates all menu work on
+   "+0x24 (stack depth) != 0 || +0x30 (current screen) != NULL". That is the
+   same test MobileMenu::Update does at its top, so reusing it is exactly the
+   engine's own idea of "a menu is on screen" - not a guess. */
+static void*  s_gMobileMenu = NULL;
 /* Latched by the pump so GetTap is a pure read; see the CGame_Process hook. */
 static bool   s_prevDown    = false;
 static int    s_tapThisFrame = 0;
@@ -1226,6 +1233,13 @@ static bool MenuKit_Init(IAML* aml)
         logger->Error("MenuKit: global pointer state NOT resolved (down=%p pos=%p) - "
                       "'tap outside' will not work, everything else will", s_pTouchDown, s_pTouchPos);
 
+    /* The game's own menu singleton. GetMenuUp() reads its screen-stack fields
+       so a client can tell "the game has a menu up" from "the player is
+       driving". Optional: without it the client just never sees menu state. */
+    s_gMobileMenu = (void*)aml->GetSym(pGameHandle, "gMobileMenu");
+    logger->Info("MenuKit: gMobileMenu = %p%s", s_gMobileMenu,
+                 s_gMobileMenu ? " (GetMenuUp available)" : " (GetMenuUp unavailable)");
+
     /* RenderWare symbol resolution for custom icons (non-fatal if missing). */
     s_pfnRwImageCreate           = (void*(*)(int,int,int))aml->GetSym(pGameHandle, "_Z13RwImageCreateiii");
     s_pfnRwImageDestroy          = (void(*)(void*))aml->GetSym(pGameHandle, "_Z14RwImageDestroyP7RwImage");
@@ -1544,6 +1558,22 @@ static int MenuKit_GetPointer(float* x, float* y, int* down)
     return 1;
 }
 
+/* v11: is a game menu on screen right now? 1 = yes, 0 = no, -1 = unknown.
+
+   Reads gMobileMenu's own screen-stack fields with the engine's own gate:
+   MobileMenu::Update top-tests `(+0x24 != 0) || (+0x30 != NULL)` and returns
+   immediately when that is false, so "no screen on the stack" is exactly what
+   the engine itself calls an idle menu. A client that draws on top of gameplay
+   needs this to know when its own input must stand down - a menu is open, the
+   finger belongs to the game, not to us. */
+static int MenuKit_GetMenuUp(void)
+{
+    if(!s_gMobileMenu) return -1;
+    const int  depth   = *(const int*)((const char*)s_gMobileMenu + 0x24);
+    const void* current = *(void* const*)((const char*)s_gMobileMenu + 0x30);
+    return (depth != 0 || current != NULL) ? 1 : 0;
+}
+
 /* v7: live on-screen rect of a widget in real pixels (l, t, r, b). The engine
    already keeps these four floats in every widget object, and a client needs
    them for hit-testing, anchoring and tooltips. Pairs with GetTap: both are in
@@ -1742,7 +1772,8 @@ static MenuKitAPI g_api = {
     MenuKit_SetDrawBlend,
     MenuKit_ResetDrawState,
     MenuKit_GetPointer,
-    MenuKit_DrawText
+    MenuKit_DrawText,
+    MenuKit_GetMenuUp
 };
 
 const MenuKitAPI* GetMenuAPI(void) { return &g_api; }

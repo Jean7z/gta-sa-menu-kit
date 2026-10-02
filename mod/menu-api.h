@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define MENUKIT_API_VERSION 10
+#define MENUKIT_API_VERSION 11
 
 typedef void (*MenuKit_OnReleaseCallback)(void* userdata);
 typedef void (*MenuKit_TickCallback)(void* userdata);
@@ -248,6 +248,25 @@ typedef struct MenuKitAPI
 
        Costs one texture per unique string, not one per call. */
     void (*DrawText)(float x, float y, const char* text, int scale, uint32_t rgba);
+
+    /* v11: is one of the game's own menus on screen right now? 1 = yes,
+       0 = no, -1 = the game singleton wasn't found (older lib, or the symbol
+       moved - treat it as "don't know", not as "no").
+
+       This exists because an overlay client and the game compete for the same
+       finger. While a menu is up the player is pressing the game's buttons, and
+       the overlay's own hit regions still see that raw touch: without a gate,
+       closing a map with a finger that lands on the overlay's icon reads as a
+       tap on that icon and pops it open. A client that draws over gameplay
+       should check this and stand down its input while it returns 1.
+
+       Implemented by reading the fields of the gMobileMenu singleton, using the
+       engine's own test (MobileMenu::Update returns early when the screen stack
+       is empty), so it is the game's definition of "busy", not a heuristic.
+
+       Added last so the struct keeps its append-only ABI: a client built
+       against an older header still runs, it just never calls this. */
+    int (*GetMenuUp)(void);
 } MenuKitAPI;
 
 /* Framework entrypoint. The framework .so exports this; client mods resolve it. */
