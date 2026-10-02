@@ -250,30 +250,74 @@ static void FitText(const char* in, char* out, size_t out_len, int max_chars)
     out[n] = 0;
 }
 
-/* Relleno redondeado sin titilar: 4 circulos de esquina + 3 rectangulos que
-   cierran los huecos. Todas las piezas son convexas, que es lo que el abanico de
-   triangulos del lienzo sabe dibujar bien. */
+/* Puntos de un arco de 90 grados, del angulo a0 a a0+90 (screen: y crece hacia
+   abajo, asi que los angulos van al reves que en matematicas). Se usan
+   poligonos, no DrawCircle: la API solo trae el circulo COMPLETO, y al trazar
+   sus 4 esquinas se dibujaba tambien el arco interior de cada una. Con
+   DrawPoly sale el cuarto exacto. */
+#define ARC_SEGS 8
+static int ArcPts(float cx, float cy, float r, float a0, float* xy)
+{
+    int i, n = 0;
+    for(i = 0; i <= ARC_SEGS; ++i)
+    {
+        const float a = a0 + (float)i * (3.14159265f * 0.5f / (float)ARC_SEGS);
+        xy[n * 2]     = cx + r * cosf(a);
+        xy[n * 2 + 1] = cy + r * sinf(a);
+        ++n;
+    }
+    return n;
+}
+
+/* Cuarto de disco relleno: el abanico del lienzo triangula desde el primer
+   vertice, asi que basta con poner el CENTRO del arco delante y luego los
+   puntos del arco. Lleno el cuarto exacto, sin salirse hacia dentro. */
+static void FillQuarterDisc(float cx, float cy, float r, float a0, unsigned int c)
+{
+    float xy[2 * (ARC_SEGS + 2)];
+    int i, n = 0;
+    xy[n * 2] = cx; xy[n * 2 + 1] = cy; ++n;              /* centro: ancla del fan */
+    n += ArcPts(cx, cy, r, a0, xy + n * 2);
+    s_api->DrawPoly(xy, n, c, 1, 1);
+}
+
+/* Cuarto de arco como simple linea: closed=0 deja que Canvas_Stroke no cierre
+   la polilinea, que es justo lo que aqui no queremos (cerrarla pintaria la
+   cuerda interior). */
+static void StrokeQuarterArc(float cx, float cy, float r, float a0, unsigned int c)
+{
+    float xy[2 * (ARC_SEGS + 1)];
+    const int n = ArcPts(cx, cy, r, a0, xy);
+    s_api->DrawPoly(xy, n, c, 0, 0);
+}
+
+/* Relleno redondeado: 4 cuartos de disco + los 3 rectangulos centrales. Ahora las
+   piezas NO se solapan (los cuartos de disco se quedan dentro de su cuadrado de
+   esquina), asi que el relleno translucido ya no se compone dos veces y las
+   esquinas no se ensucian. Todas las piezas son convexas: lo que el abanico de
+   triangulos del lienzo sabe dibujar sin titilar. */
 static void FillRoundRect(float x, float y, float w, float h, float r, unsigned int c)
 {
-    s_api->DrawCircle(x + r,     y + r,     r, c, 1, 20);
-    s_api->DrawCircle(x + w - r, y + r,     r, c, 1, 20);
-    s_api->DrawCircle(x + w - r, y + h - r, r, c, 1, 20);
-    s_api->DrawCircle(x + r,     y + h - r, r, c, 1, 20);
+    const float PI_2 = 3.14159265f * 0.5f;
+    FillQuarterDisc(x + r,     y + r,     r, PI_2 * 2.0f,        c);   /* sup izq */
+    FillQuarterDisc(x + w - r, y + r,     r, PI_2 * 3.0f, c);   /* sup der */
+    FillQuarterDisc(x + w - r, y + h - r, r, 0.0f,       c);   /* inf der */
+    FillQuarterDisc(x + r,     y + h - r, r, PI_2,       c);   /* inf izq */
     s_api->DrawRect(x + r, y,         w - 2.0f * r, h, c, 1);
     s_api->DrawRect(x,     y + r,     r,           h - 2.0f * r, c, 1);
     s_api->DrawRect(x + w - r, y + r, r,           h - 2.0f * r, c, 1);
 }
 
-/* Borde: 4 arcos + 4 lados rectos. Los arcos solos dejaban cuatro anillos
-   sueltos en las esquinas porque faltaban los lados que los unen. Los lados van
-   por DrawLine (quad de 2 triangulos), el mismo camino sobrio que el relleno: un
-   fan de perimetro para el borde es lo que parpadeaba. */
+/* Borde: 4 arcos de 90 grados + 4 lados rectos. Los arcos van como polilinea
+   abierta, no como circulo completo: DrawCircle(..., filled=0) traza los 360
+   grados y por eso se veia el arco interior de cada esquina. */
 static void StrokeRoundRect(float x, float y, float w, float h, float r, unsigned int c)
 {
-    s_api->DrawCircle(x + r,     y + r,     r, c, 0, 20);
-    s_api->DrawCircle(x + w - r, y + r,     r, c, 0, 20);
-    s_api->DrawCircle(x + w - r, y + h - r, r, c, 0, 20);
-    s_api->DrawCircle(x + r,     y + h - r, r, c, 0, 20);
+    const float PI_2 = 3.14159265f * 0.5f;
+    StrokeQuarterArc(x + r,         y + r,     r, PI_2 * 2.0f,          c);
+    StrokeQuarterArc(x + w - r,     y + r,     r, PI_2 * 3.0f, c);
+    StrokeQuarterArc(x + w - r,     y + h - r, r, 0.0f,        c);
+    StrokeQuarterArc(x + r,         y + h - r, r, PI_2,        c);
     s_api->DrawLine(x + r, y,         x + w - r, y,         c, 1.0f);
     s_api->DrawLine(x + r, y + h,     x + w - r, y + h,     c, 1.0f);
     s_api->DrawLine(x,     y + r,     x,         y + h - r, c, 1.0f);
