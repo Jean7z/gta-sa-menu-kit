@@ -32,7 +32,7 @@ LOCAL_SRC_FILES := examples/internet-radio/main.cpp \
                    mod/logger.cpp mod/config.cpp
 LOCAL_CXXFLAGS := -Os -ffunction-sections -fdata-sections -DNDEBUG -std=c++17
 LOCAL_LDFLAGS := -Wl,--gc-sections
-# -lmediandk = AMediaExtractor/AMediaCodec. mbedtls ya no se enlaza: el
-# reproductor es local, no hay nada que descargar (ver Android.mk.internetradio).
+# -lmediandk = AMediaExtractor/AMediaCodec. El reproductor es local: no descarga
+# nada, asi que no hay cliente HTTPS ni criptografia (no mbedtls) en el build.
 LOCAL_LDLIBS := -llog -lOpenSLES -lmediandk
 include $(BUILD_SHARED_LIBRARY)
