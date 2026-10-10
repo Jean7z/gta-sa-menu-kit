@@ -1,0 +1,36 @@
+name: Android arm64 build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository and PSDK submodule
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android NDK r29
+        run: sdkmanager 'ndk;29.0.14206865'
+
+      - name: Build arm64-v8a library
+        run: "$ANDROID_HOME/ndk/29.0.14206865/ndk-build"
+
+      - name: Verify build output
+        run: test -s libs/arm64-v8a/libAML_PSDK_MenuKit64.so

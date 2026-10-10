@@ -5,7 +5,7 @@ registered in the game's native widget pool, and an immediate-mode 2D canvas for
 drawing shapes, alpha and text without spending slots. Everything is resolved by
 symbol via IAML (`GetSym`), with no binary byte patching.
 
-[![Version: 11.1](https://img.shields.io/badge/version-11.1-green.svg)](https://github.com/Jean7z/gta-sa-menu-kit/releases)
+[![Version: 11.2](https://img.shields.io/badge/version-11.2-green.svg)](https://github.com/Jean7z/gta-sa-menu-kit/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Game: GTA SA 2.10 Android](https://img.shields.io/badge/game-GTA%20SA%202.10%20Android-blueviolet.svg)]()
 [![Platform: Android](https://img.shields.io/badge/platform-Android-lightgrey.svg)]()
@@ -83,7 +83,7 @@ static void Tick(void*)
     const unsigned t = NowMs() - t0;
     const unsigned char a = (unsigned char)(127 + 127 * sinf(t * 0.004f));
 
-    api->DrawRect(60, 60, 300, 100, 0x101820u | (a << 24), 1);   /* panel */
+    api->DrawRect(60, 60, 300, 100, 0x10182000u | a, 1);        /* panel */
     api->DrawCircle(90 + (t % 200), 110, 12, 0xF97316FFu, 1, 24);
     api->DrawText(60, 170, "MENUKIT V11", 2, 0x38BDF8FFu);       /* label */
 }
@@ -137,7 +137,9 @@ The canvas contract:
   where the engine already has the 2D raster set up. Drawing from the
   `CGame_Process` pump does not work: it runs before that context exists.
 - Coordinates are real pixels, the same space as `GetRect` and `GetTap`.
-- `rgba` is packed `0xRRGGBBAA`, so animating one channel is a `<<`.
+- `rgba` is packed `0xRRGGBBAA`: red is the high byte and alpha the low byte.
+  For example, `0xF97316FF` is opaque orange. Animate alpha by replacing the
+  low byte, as in the panel example above.
 - Batch ceiling: 4096 vertices and 6144 indices per frame. Once full, primitives
   are dropped and it is logged once, rather than breaking the client.
 - `DrawText` goes into the same batch as the shapes, one quad per horizontal run
@@ -216,5 +218,9 @@ a menu that was never opened is never drawn.
 - v11 verified on an arm64-v8a device: legible text, a seek bar you can drag with
   the label following your finger, shapes and alpha animating, and `GetMenuUp`
   making the launcher stop swallowing the tap that closes the map.
-- Still open: `SetText` with an external font, and cleaning up orphaned widgets
-  when the game rebuilds the pool halfway through a press.
+- A cached icon or label texture is released as soon as the last widget pointing at
+  it is removed, so a UI that swaps images (`RemoveWidget` + `AddButton` per cover,
+  say) settles at a steady handful of entries instead of growing with everything it
+  has ever displayed. A texture the engine has already recycled is dropped from the
+  cache without being destroyed, since touching it would be a use-after-free.
+- Still open: `SetText` with an external font

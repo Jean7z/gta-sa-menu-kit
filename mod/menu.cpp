@@ -146,10 +146,10 @@ static bool Canvas_Push(float x, float y, uint32_t rgba)
     v->y   = y;
     v->z   = 0.0f;
     v->rhw = 1.0f;
-    v->r   = (unsigned char)( rgba        & 0xFF);
-    v->g   = (unsigned char)((rgba >>  8) & 0xFF);
-    v->b   = (unsigned char)((rgba >> 16) & 0xFF);
-    v->a   = (unsigned char)((rgba >> 24) & 0xFF);
+    v->r   = (unsigned char)((rgba >> 24) & 0xFF);
+    v->g   = (unsigned char)((rgba >> 16) & 0xFF);
+    v->b   = (unsigned char)((rgba >>  8) & 0xFF);
+    v->a   = (unsigned char)( rgba        & 0xFF);
     v->u = v->v = 0.0f;
     return true;
 }
@@ -1482,6 +1482,49 @@ static void* MenuKit_AddButton(int menu, const char* texture, float x, float y, 
     return (void*)e;
 }
 
+/* Destroy cached textures that no live widget points at, and drop their entry.
+   Why the +1 we put on texture+0x64 at creation is the ONLY reference: we wrote
+   sprite[0] directly instead of going through CSprite2d::SetTexture, so the
+   sprite never counted itself, and the widget's own destructor does not free a
+   texture it never owned. That second half is not a guess, it is what the cache
+   cap proved: if the widget dtor freed our textures, entries would vanish as
+   widgets came and went and the cache would never have reached 48. So the
+   counter is the arbiter and Destroy is the correct release — if the engine's
+   streaming still holds a reference, Destroy only decrements and nothing is
+   freed early.
+
+   Both guards are required, not belt-and-braces:
+     - no active widget may point at the texture (its sprite would draw freed
+       memory);
+     - the liveness fingerprint must confirm the block is still ours. If the game
+       already recycled it, calling Destroy is a use-after-free, so we only drop
+       the entry and say nothing.
+   Erasing without destroying would achieve nothing: the map entry is not the
+   memory, the raster behind it is. */
+static void MenuKit_SweepTextures(std::map<std::string, IconEntry>& cache)
+{
+    if(!s_pfnRwTextureDestroy) return;
+    for(auto it = cache.begin(); it != cache.end(); )
+    {
+        IconEntry& c = it->second;
+        bool used = false;
+        for(int i = 0; i < OUR_WIDGET_LIMIT && !used; ++i)
+        {
+            const WidgetEntry& e = s_widgets[i];
+            if(!e.active) continue;
+            if(e.iconTex == c.tex || e.textTex == c.tex) used = true;
+        }
+        if(used) { ++it; continue; }
+
+        if(c.ok && c.tex && *(void**)c.tex == c.ras && MenuKit_IconContentAlive(c))
+        {
+            s_pfnRwTextureDestroy(c.tex);
+            logger->Info("MenuKit: freed unreferenced texture %p", c.tex);
+        }
+        it = cache.erase(it);
+    }
+}
+
 static void MenuKit_RemoveWidget(void* handle)
 {
     if(!handle || !s_pWidgetsPool) return;
@@ -1491,6 +1534,12 @@ static void MenuKit_RemoveWidget(void* handle)
        before destroying, so a game-reclaimed slot is never double-freed. */
     MenuKit_FreeWidgetSlot(e->widget, e->slot);
     *e = WidgetEntry{};
+    /* After the wipe, so the entry no longer counts as a user: this is the point
+       where the textures that widget was the last holder of become free. A
+       client that recreates its widgets (a cover splash swapping per track)
+       therefore holds a steady state of one texture instead of one per track. */
+    MenuKit_SweepTextures(s_iconCache);
+    MenuKit_SweepTextures(s_textCache);
     logger->Info("MenuKit: widget removed");
 }
 
@@ -1721,7 +1770,7 @@ static int MenuKit_GetRect(void* handle, float* l, float* t, float* r, float* b)
    Render2dStuff hook. Not thread-safe and not persistent - redraw every frame.
    ------------------------------------------------------------------------ */
 
-/* rgba is 0xRRGGBBAA so a client can shift/ease a channel without bit-fiddling.
+/* rgba is 0xRRGGBBAA (red high byte, alpha low byte), so a client can shift/ease a channel without bit-fiddling.
    These return void: drawing is fire-and-forget, and a full batch degrades to
    dropping primitives (counted and logged) rather than failing the client. */
 static void MenuKit_DrawRect(float x, float y, float w, float h, uint32_t rgba, int filled)
@@ -1812,7 +1861,7 @@ static void MenuKit_DrawText(float x, float y, const char* text, int scale, uint
     if(!text || !*text) return;
     if(scale < 1) scale = 1;
     if(scale > 16) scale = 16;
-    if(((rgba >> 24) & 0xFF) == 0) return;   /* fully transparent */
+    if((rgba & 0xFF) == 0) return;   /* fully transparent */
 
     const size_t len = strlen(text);
     if(len > 200) return;

@@ -98,14 +98,15 @@ typedef struct MenuKitAPI
        widget that is a few hundred px wide. Pre-downscale your own art if you
        want to control the filtering; do not pass full-res covers expecting
        them to survive.
-       (2) the cache holds at most 48 paths (~48 MiB at the 512 cap). Textures
-       are NEVER freed - the framework cannot destroy one without risking
-       use-after-free on a raster the engine may already have recycled - so
-       that count is a HARD ceiling, not tuning. Past it AddButton still
-       succeeds but the widget falls back to the game's DB texture, and the
-       log carries one "icon cache at budget" warning. If your UI cycles
-       through more distinct images than that (a music player's covers, say),
-       expect the surplus to render with no icon.
+       (2) the cache holds at most 48 paths (~48 MiB at the 512 cap). A cached
+       texture is released as soon as the last widget pointing at it goes away
+       (RemoveWidget), so the cache follows what your UI currently shows
+       instead of growing with everything it has ever shown: a music player
+       swapping one cover per track holds a steady one or two entries. That
+       still makes 48 a HARD ceiling, not tuning - a single frame with more
+       than 48 distinct images live at once exhausts it. Past the cap
+       AddButton still succeeds but the widget falls back to the game's DB
+       texture, and the log carries one "icon cache at budget" warning.
 
        Returns an opaque handle, or NULL on failure (widget limit reached). */
     void* (*AddButton)(int menu, const char* texture, float x, float y, float scale,
@@ -251,20 +252,20 @@ typedef struct MenuKitAPI
        GetRect/GetTap. scale is a glyph multiplier (1 = raw 5x7, clamped 1..16);
        the advance is 6*scale per character and the height 8*scale, so a string
        measures len*6*scale wide with no API call. rgba uses the same packing as
-       DrawRect: r in the low byte, a in the high byte.
+       DrawRect: r in the high byte, a in the low byte (0xRRGGBBAA).
 
-       Each distinct (text, scale, colour) is rasterised once into its own
-       texture and cached for the session, so a label redrawn every frame costs
-       one quad, not one upload. The texture is never destroyed by the framework
-       (same policy as the icon and label caches: they live until the game
-       closes), so the first frame of a new string is the only expensive one.
+       DrawText emits untextured quads in the same batch as the shapes. Each
+       horizontal run of lit glyph pixels becomes a quad; there is no per-string
+       texture allocation or cache. Redrawing text each frame adds geometry to
+       the current frame's batch.
 
        Draw order is call order, including relative to the shape batch: a rect
        drawn before a label sits under it, one drawn after sits on top. The
        glyphs are drawn on a transparent background, so whatever the client
        painted behind them shows through.
 
-       Costs one texture per unique string, not one per call. */
+       rgba is packed as 0xRRGGBBAA: red is the high byte and alpha is the low
+       byte, matching the other canvas primitives. */
     void (*DrawText)(float x, float y, const char* text, int scale, uint32_t rgba);
 
     /* v11: is one of the game's own menus on screen right now? 1 = yes,

@@ -16,7 +16,7 @@ ON_MOD_LOAD()
 {
     logger->SetTag("MenuKit");
     if(MenuKit_Load(aml))
-        logger->Info("SA Menu Kit v0.1 loaded - GetMenuAPI() exported");
+        logger->Info("SA Menu Kit API v%d loaded - GetMenuAPI() exported", MENUKIT_API_VERSION);
     else
         logger->Error("SA Menu Kit failed to initialise");
 }
