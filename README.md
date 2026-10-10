@@ -32,25 +32,75 @@ The output is `libs/arm64-v8a/libAML_PSDK_MenuKit64.so`. `Application.mk` pins
 the build to `arm64-v8a`; GitHub Actions builds the same target with NDK
 `29.0.14206865`.
 
-## Install
+## Integrate into a client mod
 
-Copy `libAML_PSDK_MenuKit64.so` from a [release](https://github.com/Jean7z/gta-sa-menu-kit/releases)
-to AML's mods directory:
+Menu Kit can be compiled into a client mod. This way the client does not need a
+separate `libAML_PSDK_MenuKit64.so` installed in the game mods directory.
+
+Add this repository as a recursive submodule so its PSDK dependency is present:
+
+```sh
+git submodule add https://github.com/Jean7z/gta-sa-menu-kit external/gta-sa-menu-kit
+git submodule update --init --recursive
+```
+
+In the client's `Android.mk`, compile Menu Kit's implementation and add the
+repository root to the include path:
+
+```make
+LOCAL_SRC_FILES += external/gta-sa-menu-kit/mod/menu.cpp
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/external/gta-sa-menu-kit
+LOCAL_CFLAGS += -DMENUKIT_EMBEDDED
+```
+
+The sample client is in `examples/embedded/main.cpp`. Build it with
+`ndk-build MENUKIT_EMBEDDED_EXAMPLE=1`; CI builds both this sample and the
+standalone mod. The client must already link the PSDK logger (`logger`); do not compile a second
+logger implementation if its project already provides one. In the client mod's
+`ON_MOD_LOAD`, initialize the embedded copy and keep the returned API pointer:
+
+```cpp
+#include <mod/menu-api.h>
+
+static const MenuKitAPI* g_menuKit;
+
+ON_MOD_LOAD()
+{
+    g_menuKit = MenuKit_InitEmbedded(aml);
+    if(!g_menuKit) return;
+    // Use g_menuKit->AddButton(), DrawRect(), and the other API members.
+}
+
+ON_MOD_UNLOAD()
+{
+    MenuKit_Shutdown();
+}
+```
+
+Each client mod that compiles Menu Kit gets an independent copy with its own
+widgets, canvas callback, caches, and frame/render hooks. Embedding it in several
+client mods therefore installs several copies. `MenuKit_Shutdown()` releases
+widgets and clears the callback, but AML does not provide a hook handle here, so
+the client mod must remain loaded for the lifetime of the game process. Use the
+standalone mod when several clients should use one shared Menu Kit instance.
+
+## Standalone mod
+
+A prebuilt AML mod is also available from [Releases](https://github.com/Jean7z/gta-sa-menu-kit/releases).
+Install `libAML_PSDK_MenuKit64.so` in AML's mods directory:
 
 ```text
 Android/data/com.rockstargames.gtasa/mods/
 ```
 
-If Android restricts access to that directory, copy the file with Shizuku. For
-example, from Termux after downloading the release asset to `Download`:
+Load it before client mods. Clients using this standalone option resolve the
+API with `MenuKit_GetAPI(aml)`; it returns `NULL` if the library or exported API
+is unavailable. Android may restrict access to the mods directory; Shizuku can
+copy the release asset there from Termux:
 
 ```sh
 ~/shizuku/rish -c "cp /sdcard/Download/libAML_PSDK_MenuKit64.so /sdcard/Android/data/com.rockstargames.gtasa/mods/"
 ```
-
-AML loads mods by filename. Load the framework before client mods so
-`MenuKit_GetAPI()` can resolve it during the client's `ON_MOD_LOAD` callback.
-The helper returns `NULL` if the library or exported API is not available.
 
 ## Use the API
 
@@ -88,7 +138,7 @@ static void DrawFrame(void*)
 
 ON_MOD_LOAD()
 {
-    g_menuKit = MenuKit_GetAPI(aml);
+    g_menuKit = MenuKit_InitEmbedded(aml);
     if(!g_menuKit || g_menuKit->version < MENUKIT_API_VERSION) return;
 
     void* button = g_menuKit->AddButton(0, "_shoot", 320, 380, 20, NULL, NULL, NULL);
@@ -102,10 +152,10 @@ ON_MOD_LOAD()
 }
 ```
 
-`SetTick` is one shared callback slot. Calling it replaces the previous
-callback, so client mods that need a frame callback must coordinate ownership.
-The callback runs on the game's processing thread; keep it short and issue
-canvas draw calls there.
+`SetTick` is one callback slot per Menu Kit instance. Calling it replaces the
+previous callback. With source integration, each client mod has its own slot;
+with the standalone mod, all clients share one slot. The callback runs on the
+game's processing thread; keep it short and issue canvas draw calls there.
 
 ## API reference
 

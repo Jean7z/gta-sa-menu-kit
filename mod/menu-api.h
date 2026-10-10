@@ -104,8 +104,19 @@ typedef struct MenuKitAPI
     int (*GetMenuUp)(void);
 } MenuKitAPI;
 
-/* Exported entrypoint resolved by client mods through AML. */
+/* Initialize a source-integrated copy and return its API. Compile mod/menu.cpp
+   into the client mod and call this from ON_MOD_LOAD. */
+const MenuKitAPI* MenuKit_InitEmbedded(IAML* aml);
+
+/* Release widgets and clear callbacks. AML hooks remain installed for the process. */
+void MenuKit_Shutdown(void);
+
+/* Entry point resolved by clients when Menu Kit is installed as a separate mod. */
+#if defined(MENUKIT_EMBEDDED)
+__attribute__((visibility("hidden")))
+#else
 __attribute__((visibility("default")))
+#endif
 const MenuKitAPI* GetMenuAPI(void);
 
 #ifdef __cplusplus

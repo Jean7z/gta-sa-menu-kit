@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-MYMODCFG(net.psdk.samod.menukit, SA Menu Kit, 1.1, Jean7z)
+MYMODCFG(net.psdk.samod.menukit, SA Menu Kit, 1.2, Jean7z)
 
 /* The engine implementation resolves the game symbols through AML. */
 extern "C" bool  MenuKit_Load(IAML* aml);

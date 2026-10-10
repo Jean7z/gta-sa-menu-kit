@@ -13,6 +13,7 @@
 
 /* stb_image: decodes the button's custom icon PNG. STB_IMAGE_IMPLEMENTATION
    must be defined exactly here (the single TU that does it). */
+#define STB_IMAGE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
@@ -1338,7 +1339,7 @@ static bool MenuKit_Init(IAML* aml)
     return true;
 }
 
-/* ---- API impl (exported by main.cpp's GetMenuAPI) ---- */
+/* ---- API implementation ---- */
 static void* MenuKit_AddButton(int menu, const char* texture, float x, float y, float scale,
                                MenuKit_OnReleaseCallback onRelease, void* userdata,
                                const char* icon)
@@ -1761,9 +1762,16 @@ static MenuKitAPI g_api = {
 
 const MenuKitAPI* GetMenuAPI(void) { return &g_api; }
 
+/* Source-integrated clients initialize their local copy directly. */
+extern "C" __attribute__((visibility("hidden")))
+const MenuKitAPI* MenuKit_InitEmbedded(IAML* aml)
+{
+    return MenuKit_Init(aml) ? &g_api : NULL;
+}
+
 /* Destroy widgets still owned by the framework and clear the client callback.
    FreeWidgetSlot checks pool ownership before calling the widget destructor. */
-extern "C" __attribute__((visibility("default")))
+extern "C" __attribute__((visibility("hidden")))
 void MenuKit_Shutdown(void)
 {
     int freed = 0;
