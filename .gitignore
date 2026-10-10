@@ -1,10 +1,10 @@
-# Artefactos de build (regenerables con ndk-build)
+# Regenerable ndk-build output
 /obj/
 /libs/
 
-# Artefactos de prueba: el MP3 es material con copyright de terceros
+# Test audio asset
 test.mp3
 
-# Termux / editor
+# Editor and Termux files
 *.swp
 *~

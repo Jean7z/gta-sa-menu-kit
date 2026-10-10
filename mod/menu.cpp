@@ -1,5 +1,5 @@
-/* SA Menu Kit - engine (Route B: symbol-only widget-pool injection).
-   Resolves every game address by name via IAML; zero hardcoded offsets.
+/* SA Menu Kit engine.
+   Resolves game symbols by name through IAML; no game addresses are hardcoded.
    Widget objects live in the game's CTouchInterface::m_pWidgets pool, so the
    game itself updates/draws/touches them like native buttons. */
 #include <mod/amlmod.h>
@@ -16,19 +16,13 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
-/* Plan B: embedded 5x7 bitmap font (public domain, Adafruit GFX layout).
-   Text does NOT use CFont (Task 0 experiment: CFont does not composite in this
-   fork and flushing it breaks the HUD). Instead it is rasterized here into an
-   RGBA buffer and uploaded through the SAME icon pipeline (RwImage -> raster
-   0x10 -> clean texture), baked into the very texture Draw paints -> guaranteed
-   composition. */
+/* Embedded 5x7 bitmap font used for widget labels. */
 #include "font5x7.h"
 
 #define MAX_POOL_SLOTS 190              /* game's widget pool size (MAX_WIDGETS_GAME) */
 #define OUR_WIDGET_LIMIT 16
 #define MENU_STACK_MAX 8                /* nested OpenMenu depth (root group 0 is implicit at depth 0) */
-#define WIDGET_ALLOC_SIZE 0x200         /* ponytail: unknown CWidgetButton size; over-alloc
-                                           (ctor inits the real layout; game never reads beyond it) */
+#define WIDGET_ALLOC_SIZE 0x200         /* CWidgetButton size is not exposed by the PSDK. */
 
 /* Mirror of game's WidgetPosition (psdk) - 4 floats, aggregate. */
 struct WidgetPosition { float m_fOriginX, m_fOriginY, m_fScaleX, m_fScaleY; };
@@ -42,8 +36,8 @@ static bool               (*s_pfnIsTouched )(int widgetId, void* unused, int fra
 /* RenderWare symbols (exported by libGTASA.so) for custom button icons.
    RwImage layout verified by disasm (RwImageCreate @0x2709d8): flags@+0,
    width@+4, height@+8, depth@+12, free@+16, cpPixels@+24. RwImageDestroy frees
-   cpPixels ONLY if flags bit0 is set — we never set it, so the stbi buffer is
-   never touched by the engine. */
+   cpPixels only if flags bit 0 is set. That flag is left clear, so the engine
+   does not free the stb_image buffer. */
 /* RwImage layout in this fork (disasm: RwImageCreate 0x2709d8,
    _rwRasterSetFromImage8888 0x23b264): flags@0x00, width@0x04, height@0x08,
    depth@0x0c, stride@0x10, cpPixels@0x18. RwImageCreate leaves stride
@@ -86,7 +80,7 @@ static void  (*s_pfnRwRasterUnlock)(void*) = NULL;
 
 /* ---- v8: immediate-mode 2D canvas ---------------------------------------
    The engine already exposes RenderWare's 2D immediate pipeline, which is all a
-   shape/alpha layer needs: per-vertex RGBA plus blend state. No ImGui, no DOM.
+   shape/alpha layer needs: per-vertex RGBA plus blend state.
 
    Clients do NOT call RenderWare. They push geometry from SetTick (which runs
    in the CGame_Process pump); we accumulate it and flush the WHOLE frame as a
@@ -280,24 +274,10 @@ static void*  s_gMobileMenu = NULL;
 static bool   s_prevDown    = false;
 static int    s_tapThisFrame = 0;
 static float  s_tapX = 0.0f, s_tapY = 0.0f;
-static int    s_tapCount = 0;   /* DEBUG: counts rising edges to expose a bouncing signal */
-/* Bounded proof that m_vecCachedPos tracks a DRAG and not just the touchdown
-   point: logs only while a finger is down AND the point moved >4px since the
-   last line. This is the evidence GetPointer's drag story depends on - if the
-   engine only cached the initial press point, these would never fire. */
-static int    s_dragLogCount = 0;
-static float  s_dragLastX = 0.0f, s_dragLastY = 0.0f;
 
-/* Icon cache: same path -> same RwTexture (shared across buttons). Created
-   once and NEVER destroyed by the mod: we write sprite[0] (+0x10) directly and
-   the widget is never SetTexture'd again, so no double-free. ponytail: the
-   textures live until the game closes; accepted. */
-/* Icon cache. ok = the raster-member fingerprint was verified at creation
-   (RwTexture.raster@0x0 readback == the raster we handed RwTextureCreate).
-   The game's streaming heap can recycle our block without touching the
-   widget's sprite pointer (observed: slot keeps our tex addr but renders a
-   game ped texture), so every cache hit re-checks the fingerprint and reloads
-   the PNG fresh when the block was stolen. */
+/* Icon cache entries are keyed by path and shared by widgets. Each entry stores
+   the texture and raster identity used to detect when game streaming recycles
+   either allocation. Unused entries are released when widgets are removed. */
 struct IconEntry
 {
     void*  tex;
@@ -310,17 +290,13 @@ struct IconEntry
     unsigned char snap[16]; /* 16B at the center sample (red) */
 };
 static std::map<std::string, IconEntry> s_iconCache;
-/* Textures are NEVER freed (s_pfnRwTextureDestroy has no call sites), so this
-   cap is a hard ceiling on icon memory, not a cache tuning knob. 48 entries at
-   the 512 px cap is ~48 MiB of rasters. */
+/* Maximum number of icon cache entries. At 512x512 RGBA, the raster budget is
+   approximately 48 MiB. */
 #define ICON_CACHE_MAX_ENTRIES 48
 static bool s_iconCacheFullLogged = false;
 
-/* Plan B: label-texture cache. Same path-key trick as s_iconCache but keyed
-   by the label string; rendered once and NEVER destroyed by the mod (same
-   ponytail as icons: textures live until the game closes). Same liveness
-   machinery: texture block recycling by the game is detected via the raster
-   fingerprint re-check so the pump can re-render fresh. */
+/* Label textures are cached by icon path and label text. The pump checks their
+   raster identity before reuse and rebuilds a label if streaming replaced it. */
 static std::map<std::string, IconEntry> s_textCache;
 
 /* Widget registry */
@@ -336,7 +312,7 @@ struct WidgetEntry
     char        texture[64];  /* saved so the widget can be (re)built lazily */
     char        icon[256];    /* custom icon PNG path (absolute device path); empty = game default */
     void*       iconTex;      /* cached custom RwTexture from MenuKit_LoadIcon; NULL = none/failed */
-    char        text[128];    /* Plan B label: rendered by SetText into a texture ("" = no label) */
+    char        text[128];    /* SetText label; empty means no label */
     void*       textTex;      /* cached label texture from MenuKit_RenderTextTexture */
     uint8_t     alpha;        /* 0..255 written at build; 0xFF = opaque (SetAlpha) */
     uint8_t     visible;      /* 0 = parked (not drawn, not touchable); SetVisible */
@@ -394,12 +370,9 @@ static bool MenuKit_IconContentAlive(const IconEntry& c)
     return true; /* no CPU pixel path outside lock; dims gate only */
 }
 
-/* Load a custom icon PNG (absolute device path) into an RwTexture, replicating
-   1:1 the game's own pipeline (CSprite2d::SetTexture @0x6ecce8: findRasterFormat
-   -> rasterCreate -> rasterSetFromImage -> textureCreate). Zero ownership
-   tricks: the stbi buffer lives only during the call (cpPixels is cleared
-   before RwImageDestroy; flags bit0 never set, so the engine never frees it).
-   Result is cached by path and never destroyed by the mod. */
+/* Load a custom icon PNG from an absolute path and create an RwTexture using
+   the game's image-to-raster pipeline. The decoded pixel buffer is freed after
+   upload; the resulting texture is cached by path. */
 /* Covers arrive at 1200-1500 px but the widgets that display them are ~300 px,
    and a raster costs w*h*4. Measured: three covers (1200^2 + 1400^2 + 1500^2 =
    5.8+7.8+9 MB) exhaust the RenderWare raster pool, and the NEXT
@@ -456,13 +429,8 @@ static void* MenuKit_LoadIcon(const char* path)
         const IconEntry& c = it->second;
         if(c.ok)
         {
-            /* Liveness check: RwTexture.raster@0x0 must still point at the
-               raster we created, AND the raster's pixel center must still hold
-               our icon (content fingerprint). The game's streaming can recycle
-               the texture block (slot keeps our tex pointer but the content is
-               now a game texture) or just the raster's pixel buffer (texture
-               struct checks pass but the button shows a borrowed/white texture).
-               On mismatch we drop the entry and reload fresh. */
+            /* Confirm the texture still references our raster and that streaming
+           has not replaced its pixel buffer. */
             if(c.tex && *(void**)c.tex == c.ras && MenuKit_IconContentAlive(c))
                 return c.tex;
             logger->Info("MenuKit: icon '%s' recycled by game, reloading fresh", path);
@@ -474,26 +442,16 @@ static void* MenuKit_LoadIcon(const char* path)
         }
     }
 
-    /* NOTHING in this framework ever frees a texture: s_pfnRwTextureDestroy is
-       resolved but has zero call sites. So every texture we build leaks for the
-       rest of the process, and s_iconCache is what stops us building the SAME
-       one twice. Bound the leak by refusing to build once the cache is at its
-       budget, NOT by destroying: calling RwTextureDestroy on a raster the engine
-       may already have recycled is use-after-free, and mutating the refcount at
-       +0x64 to "make it safe" is a guess about engine internals on a field the
-       liveness check only ever READS. Returning NULL here is safe: both callers
-       fall back to the widget's default sprite. */
+    /* Keep the icon cache within its memory budget. Unused entries are released
+       by MenuKit_SweepTextures when their widgets are removed. */
     if(s_iconCache.size() >= ICON_CACHE_MAX_ENTRIES)
     {
         if(!s_iconCacheFullLogged)
         {
             s_iconCacheFullLogged = true;
-            logger->Print(LogP_Warn, "MenuKit: icon cache at budget (%d entries, ~%d MiB of rasters at %d px) — "
-                         "further icons skipped; textures are never freed, so this is a "
-                         "hard memory ceiling, not a soft one",
-                         ICON_CACHE_MAX_ENTRIES,
-                         (int)((size_t)ICON_CACHE_MAX_ENTRIES * ICON_MAX_DIM * ICON_MAX_DIM * 4 / (1024 * 1024)),
-                         ICON_MAX_DIM);
+            logger->Print(LogP_Warn, "MenuKit: icon cache reached its %d-entry limit; "
+                         "further icons will use the game's default texture",
+                         ICON_CACHE_MAX_ENTRIES);
         }
         return NULL;
     }
@@ -511,14 +469,17 @@ static void* MenuKit_LoadIcon(const char* path)
         if(nw < 1) nw = 1;
         if(nh < 1) nh = 1;
         stbi_uc* small = (stbi_uc*)malloc((size_t)nw * (size_t)nh * 4);
-        if(small)
+        if(!small)
         {
-            Icon_DownscaleRGBA(px, w, h, small, nw, nh);
+            logger->Error("MenuKit: cannot resize icon '%s'", path);
             stbi_image_free(px);
-            px = small;
-            logger->Info("MenuKit: icon '%s' %dx%d -> %dx%d (raster pool is finite)", path, w, h, nw, nh);
-            w = nw; h = nh;
+            return NULL;
         }
+        Icon_DownscaleRGBA(px, w, h, small, nw, nh);
+        stbi_image_free(px);
+        px = small;
+        logger->Info("MenuKit: icon '%s' %dx%d -> %dx%d (raster pool is finite)", path, w, h, nw, nh);
+        w = nw; h = nh;
     }
 
     void* img = s_pfnRwImageCreate(w, h, 32);
@@ -678,14 +639,9 @@ static void* MenuKit_LoadIcon(const char* path)
     return NULL;
 }
 
-/* ---- Plan B: label textures (NO CFont — CFont no compone en este fork) ----
-   Same upload path as MenuKit_LoadIcon (findRasterFormat 0x10 -> rasterCreate
-   -> setFromImage -> textureCreate -> refcount +0x64), factored out so the
-   icon path and the label path share ONE verified pipeline. The label is
-   rasterized with the embedded 5x7 bitmap font and COMPOSITED either over the
-   widget's icon PNG pixels (text inside the button image -> guaranteed on
-   top) or over a generated dark panel sized to the widget's live on-screen
-   rect (floats l/t/r/b at +0x2c..+0x38, real pixels). */
+/* Widget labels are rasterized with the embedded font and uploaded through the
+   same RenderWare pipeline as custom icons. Labels are composited over the icon
+   or rendered on a generated panel when no icon is set. */
 
 /* Upload an RGBA8 buffer to a fresh RwTexture (game's own pipeline). The
    buffer is consumed (copied by RwRasterSetFromImage, then freed here).
@@ -779,16 +735,9 @@ static stbi_uc* MenuKit_RasterizeText(const char* text, int scale,
     return px;
 }
 
-/* Full label pipeline: build (or fetch cached) the RwTexture that carries the
-   label, composited per the rules above. Called from the pump only (RW
-   symbols + live screen dims are runtime things). Cached by (icon|text) — the
-   friendly reload path mirrors LoadIcon's liveness (member + raster check).
-   The widget param is the registry entry (not the game object): Variant B
-   projects the widget's VIRTUAL 640x448 position to real pixels instead of
-   reading the game widget's live rect (+0x2c..+0x38), which our widgets keep
-   at the 1e6 sentinel (the game never updates it for touch-immune buttons:
-   the pool dump showed 1e6/-1e6 rects and the resulting absurd h silently
-   failed the raster). */
+/* Build or fetch a cached label texture. Rendering runs from the game-frame
+   pump, after RenderWare and screen dimensions are available. The cache key
+   includes the icon path and label text. */
 static void* MenuKit_RenderTextTexture(const char* text, const char* icon, const WidgetEntry& e)
 {
     if(!text || !*text) return NULL;
@@ -911,16 +860,9 @@ static void MenuKit_BuildWidget(WidgetEntry& e)
 {
     void* mem = ::operator new(WIDGET_ALLOC_SIZE);
     memset(mem, 0, WIDGET_ALLOC_SIZE);
-    /* ponytail: an old widget may have been freed by the game; we never free it
-       ourselves (double-free risk). Fixed limit keeps the leak bounded.
-       Ctor args mirror the game's native attack button (CWidgetButtonAttackC2
-       0x47444c): it calls CWidgetButtonC2 with (param4=1, param5=0x100,
-       param6=1) -> base flags +0x8c = 0x100|0x3 = 0x103, HIDMapping +0x8 = 1,
-       +0xa4 = 1. Our old SDK call (1, 0, 0) produced +0x8c = 0x03 and HID = 0.
-       NOTE: e.texture must be a name that exists in the game's texture DB
-       (e.g. "_shoot" used by the native attack button); the ctor resolves it
-       by name via TextureDatabaseRuntime and a bogus name leaves the sprite
-       empty -> invisible button. */
+    /* The constructor arguments match the game's native attack button. The
+       texture name must exist in the game's texture database; an unknown name
+       leaves the widget without a sprite. */
     ((void(*)(void*, const char*, const WidgetPosition*, unsigned, unsigned, int))s_pfnCtorButton)
         (mem, e.texture, &e.pos, 1, 0x100, 1);
     /* Render visibility, reverse-engineered from libGTASA.so:
@@ -955,9 +897,8 @@ static void MenuKit_BuildWidget(WidgetEntry& e)
             logger->Info("MenuKit: widget '%s' uses custom icon", e.texture);
         }
     }
-    /* Plan B label: like the icon, swap sprite[0] post-ctor. The label
-       texture is either the icon pixels + text baked in, or a generated dark
-       panel (no icon). It intentionally WINS over the icon (it includes it). */
+    /* Apply the label texture after the icon. When an icon is present, the label
+       texture already contains the icon pixels. */
     if(e.text[0])
     {
         void* tex = MenuKit_RenderTextTexture(e.text, e.icon[0] ? e.icon : NULL, e);
@@ -1159,39 +1100,12 @@ DECL_HOOKv(CGame_Process, void)
             s_tapX = s_pTouchPos[0];
             s_tapY = s_pTouchPos[1];
             s_tapThisFrame = 1;
-            /* One-shot proof the pointer globals work and the units are sane.
-               Bounded at a few so a real play session cannot spam the log. */
-            if(s_tapCount < 3)
-            {
-                s_tapCount++;
-                logger->Info("MenuKit: TAP#%d at (%g,%g) real px", s_tapCount, s_tapX, s_tapY);
-            }
-        }
-        /* Drag proof for v9 GetPointer: while a finger is down and the cached
-           point moves >4px from the last logged one, the engine is reporting a
-           live position, not a frozen touchdown point. A slider needs exactly
-           this. Bounded so holding still cannot spam. */
-        if(down && s_dragLogCount < 8)
-        {
-            float dx = s_pTouchPos[0] - s_dragLastX;
-            float dy = s_pTouchPos[1] - s_dragLastY;
-            if(dx * dx + dy * dy > 16.0f)
-            {
-                s_dragLogCount++;
-                s_dragLastX = s_pTouchPos[0];
-                s_dragLastY = s_pTouchPos[1];
-                logger->Info("MenuKit: DRAG#%d at (%g,%g) real px", s_dragLogCount, s_dragLastX, s_dragLastY);
-            }
         }
         s_prevDown = down;
     }
 
-    /* Client timer tick. BEFORE the pool check: a client counting down an
-       auto-hide should not lose frames just because the pool is late, and
-       Add/Remove are deferred so they are safe either way.
-
-       Canvas_Clear runs first so the tick rebuilds this frame's geometry from
-       scratch: the batch is per-frame, not a persistent scene graph. */
+    /* Start a fresh canvas batch before invoking the client callback. The
+       callback runs once per game frame, even if the widget pool is unavailable. */
     Canvas_Clear();
     if(s_tick) s_tick(s_tickUser);
 
@@ -1201,12 +1115,8 @@ DECL_HOOKv(CGame_Process, void)
     for(int i = 0; i < OUR_WIDGET_LIMIT; ++i)
     {
         WidgetEntry& e = s_widgets[i];
-        /* Re-evaluate the active menu on EVERY entry: release callbacks
-           (OpenMenu/CloseMenu) mutate the stack mid-loop. A value captured at
-           loop entry would rebuild widgets of the just-closed menu in the very
-           same frame — leaving a ghost button drawn stacked on top of the root
-           (user-visible as a "duplicated shoot button") — and would tie the
-           opening group's build to stale slots. */
+        /* Release callbacks can change the active group during this loop, so
+           check it for each widget before building. */
         if(!e.active || e.menu != MenuKit_CurrentMenu()) continue;
 
         /* Game rebuilds the pool (menu open/close, entering a vehicle, etc.):
@@ -1217,14 +1127,8 @@ DECL_HOOKv(CGame_Process, void)
            CWidgetButton would crash. */
         if(e.widget == NULL || e.slot < 0 || e.slot >= MAX_POOL_SLOTS || s_pWidgetsPool[e.slot] != e.widget)
         {
-            /* Need (re)assignment: a deferred registration waiting for the
-               engine (slot=-1), the game rebuilt the pool and freed ours,
-               or the game took our slot for its own widget. Reclaim the
-               TOPMOST free slot after the game's own build pass. m_pWidgets
-               is one contiguous pool; the game pre-creates most of it (observed
-               172/190 with menus open, native attack button at 187), so the top
-               of the free range is the safe zone — the vehicle-mode dump below
-               verifies which slots the game's vehicle buttons actually use. */
+            /* The game may rebuild the pool or reuse our slot. Claim a free
+               slot after the game's own update, starting at the end of the pool. */
             int newSlot = -1;
             for(int s = MAX_POOL_SLOTS - 1; s >= 0; --s)
                 if(s_pWidgetsPool[s] == NULL) { newSlot = s; break; }
@@ -1267,14 +1171,8 @@ DECL_HOOKv(CGame_Process, void)
             }
         }
 
-        /* Plan B: re-protect the label exactly like the icon. RenderTextTexture
-           is cached (key = texture|text) and liveness-checked (member pointer
-           vs stored raster) inside, so this is cheap when nothing was stolen;
-           when the game recycled the block it re-renders and we swap the new
-           texture in. Also covers SetText() called at runtime: the new text is
-           marked textTex=NULL (force) and this block rebuilds it on the next
-           frame. The label always wins sprite[0] over the icon (it includes
-           the icon pixels when one is set). */
+        /* Reuse the cached label texture when it is still live. SetText clears
+           textTex so the next pump renders the updated label. */
         if(e.widget && e.text[0])
         {
             void* want = MenuKit_RenderTextTexture(e.text, e.icon[0] ? e.icon : NULL, e);
@@ -1482,25 +1380,8 @@ static void* MenuKit_AddButton(int menu, const char* texture, float x, float y, 
     return (void*)e;
 }
 
-/* Destroy cached textures that no live widget points at, and drop their entry.
-   Why the +1 we put on texture+0x64 at creation is the ONLY reference: we wrote
-   sprite[0] directly instead of going through CSprite2d::SetTexture, so the
-   sprite never counted itself, and the widget's own destructor does not free a
-   texture it never owned. That second half is not a guess, it is what the cache
-   cap proved: if the widget dtor freed our textures, entries would vanish as
-   widgets came and went and the cache would never have reached 48. So the
-   counter is the arbiter and Destroy is the correct release — if the engine's
-   streaming still holds a reference, Destroy only decrements and nothing is
-   freed early.
-
-   Both guards are required, not belt-and-braces:
-     - no active widget may point at the texture (its sprite would draw freed
-       memory);
-     - the liveness fingerprint must confirm the block is still ours. If the game
-       already recycled it, calling Destroy is a use-after-free, so we only drop
-       the entry and say nothing.
-   Erasing without destroying would achieve nothing: the map entry is not the
-   memory, the raster behind it is. */
+/* Release cached textures no widget uses. Check the raster fingerprint before
+   destroying: the game may have recycled the texture or raster allocation. */
 static void MenuKit_SweepTextures(std::map<std::string, IconEntry>& cache)
 {
     if(!s_pfnRwTextureDestroy) return;
@@ -1551,10 +1432,8 @@ static bool MenuKit_IsReleased(void* handle)
     return s_pfnIsReleased(e->slot, NULL, 1);
 }
 
-/* Open menu: destroy the current group's pool widgets, push the menu, let the
-   pump rebuild the new group at topmost free on the next frame. Refuses to
-   open when the group cannot fully fit in the pool (approved fallback: log +
-   don't open, instead of a half-drawn menu). */
+/* Switch groups only when the destination group can fit in the available pool
+   slots. The new group is built by the next game-frame update. */
 static int MenuKit_OpenMenu(int menu)
 {
     if(menu <= 0) { logger->Error("MenuKit: OpenMenu(%d): invalid id (root is 0, menus are 1+)", menu); return -1; }
@@ -1589,12 +1468,7 @@ static int MenuKit_CloseMenu(void)
     return 0;
 }
 
-/* Plan B (v4): SetText. Changes the label of an existing widget (POST-build
-   or deferred — both work). Safe before the widget exists: the pump renders
-   the label from e.text in the same re-protect pass that builds widgets, so
-   this only flips a string buffer and lets the deterministic next-frame pump
-   do the RenderWare work. textTex=NULL forces a re-render of the cached
-   label (the texture carries the old text, so the cache key must change). */
+/* Set the label text and have the next pump update its texture. */
 static void MenuKit_SetText(void* handle, const char* text)
 {
     if(!handle) return;
@@ -1606,8 +1480,7 @@ static void MenuKit_SetText(void* handle, const char* text)
     logger->Info("MenuKit: widget '%s' text set to '%s'", e->texture, e->text[0] ? e->text : "(none)");
 }
 
-/* v5: register the client's per-frame callback (NULL clears it). Invoked from
-   the CGame_Process pump, so it runs once per rendered frame. */
+/* Register the shared per-frame callback; NULL clears it. */
 static void MenuKit_SetTick(MenuKit_TickCallback onTick, void* userdata)
 {
     s_tick = onTick;
@@ -1615,10 +1488,8 @@ static void MenuKit_SetTick(MenuKit_TickCallback onTick, void* userdata)
     logger->Info("MenuKit: client tick %s", onTick ? "registered" : "cleared");
 }
 
-/* v5: alpha 0..255. Applied at build (replacing the old hardcoded 0xFF) AND,
-   when the widget is already live, written straight into its alpha byte so a
-   dim/bright toggle needs no remove+rebuild — which matters because the client
-   never frees widget objects itself, so every rebuild would leak one. */
+/* Set the desired alpha and apply it immediately when the widget is live. The
+   pump reapplies the value after the game's update each frame. */
 static void MenuKit_SetAlpha(void* handle, unsigned char alpha)
 {
     if(!handle) return;
@@ -1629,9 +1500,7 @@ static void MenuKit_SetAlpha(void* handle, unsigned char alpha)
                  e->widget ? "" : " (pending build)");
 }
 
-/* v5: show/hide. Hiding clears the touch-immune flag and zeroes the alpha, so
-   CTouchInterface re-applies SetEnabled(w,0) every frame and the widget stops
-   eating taps as well as stop drawing. */
+/* Show or park a widget. Parked widgets are neither drawn nor touchable. */
 static void MenuKit_SetVisible(void* handle, int visible)
 {
     if(!handle) return;
@@ -1642,24 +1511,8 @@ static void MenuKit_SetVisible(void* handle, int visible)
     logger->Info("MenuKit: widget '%s' %s", e->texture, on ? "shown" : "parked");
 }
 
-/* v6: resize a widget in REAL pixels, keeping the centre the engine computed.
-
-   This is what breaks the "everything is a square" limit. The engine derives
-   both axes from ONE uniform `scale` (one number for width and height), so
-   every widget AddButton builds is square. The four floats the engine already
-   keeps in the object (+0x2c..+0x38) are just as writable, so decoupling them
-   lets a client express panels, bars and banners.
-
-   Deliberately SIZE-ONLY, not x/y/w/h. An earlier absolute-rect version needed
-   the true screen size, and OS_ScreenGetWidth() is not that: it reported
-   1024x600 while the real render is 1600x720, so absolute coordinates landed
-   the widget in the middle of the screen. Resizing around the engine's own
-   centre sidesteps the question entirely - the virtual-unit placement the
-   engine already does is correct and device-independent, so the anchor keeps
-   working and only the shape changes.
-
-   Re-asserted every frame by the pump (see MenuKit_ApplyState), so the engine
-   cannot take the size back. */
+/* Set dimensions in real pixels while preserving the center computed by the
+   game. The pump reapplies the size after the game's widget update. */
 static void MenuKit_SetSize(void* handle, float w, float h)
 {
     if(!handle) return;
@@ -1677,18 +1530,8 @@ static void MenuKit_SetSize(void* handle, float w, float h)
                  e->texture, w, h, e->widget ? "" : " (pending build)");
 }
 
-/* v7: where the player tapped, anywhere on screen.
-
-   AML has no touch/pad API, so a client could only ever react to touches landing
-   on one of its OWN widgets - and the usual workaround, a full-screen catcher
-   widget, silently eats the game's joystick and fire button. Reading the game's
-   own pointer globals removes the limitation instead of working around it.
-
-   Returns 1 on the frame a NEW tap begins (rising edge) and writes the position
-   in the same real-pixel space as GetRect, so a client hit-tests with two
-   numbers and no coordinate conversion. Holding a finger is one tap, not one
-   per frame. Returns 0 if the pointer globals were not resolved, or if the tap
-   was not this frame. */
+/* Return the position of a new touch in real pixels. A held touch produces one
+   tap; subsequent frames return 0 until the next touch begins. */
 static int MenuKit_GetTap(float* x, float* y)
 {
     if(!s_tapThisFrame) return 0;
@@ -1697,15 +1540,8 @@ static int MenuKit_GetTap(float* x, float* y)
     return 1;
 }
 
-/* v9: live pointer state, polled every frame. Reads the SAME engine statics
-   GetTap latches from, but without the rising-edge/one-frame gate, so a client
-   can follow a finger across the screen instead of only seeing where it landed.
-   That is the whole difference between a tap and a drag, and a slider, a swipe
-   or a scroll list are all drags.
-
-   The outs are left untouched on failure so a caller that forgot to check the
-   return value keeps its previous value instead of reading uninitialised
-   stack. */
+/* Read the current pointer position and down state. Output parameters remain
+   unchanged if the game pointer symbols are unavailable. */
 static int MenuKit_GetPointer(float* x, float* y, int* down)
 {
     if(!s_pTouchDown || !s_pTouchPos) return 0;
@@ -1770,7 +1606,7 @@ static int MenuKit_GetRect(void* handle, float* l, float* t, float* r, float* b)
    Render2dStuff hook. Not thread-safe and not persistent - redraw every frame.
    ------------------------------------------------------------------------ */
 
-/* rgba is 0xRRGGBBAA (red high byte, alpha low byte), so a client can shift/ease a channel without bit-fiddling.
+/* Colors use 0xRRGGBBAA (red in the high byte, alpha in the low byte).
    These return void: drawing is fire-and-forget, and a full batch degrades to
    dropping primitives (counted and logged) rather than failing the client. */
 static void MenuKit_DrawRect(float x, float y, float w, float h, uint32_t rgba, int filled)
@@ -1809,12 +1645,7 @@ static void MenuKit_DrawTriangle(float x1, float y1, float x2, float y2, float x
 static void MenuKit_DrawLine(float x1, float y1, float x2, float y2, uint32_t rgba, float width)
 {
     if(width <= 0.0f) return;
-    /* A line is ALWAYS rasterized as a quad (2 triangles, 6 indices). There used
-       to be a 2-loose-indices shortcut, and it was broken: the batch is drawn as
-       RW_PRIMTYPE_TRI_LIST, which consumes indices 3 at a time, so a stray pair
-       misaligned every following primitive and a line at the end of the batch ran
-       off the end of the index buffer. Every batch emitter must emit multiples
-       of 3. */
+    /* Emit two triangles so the line has a consistent width in real pixels. */
     if(width < 1.0f) width = 1.0f;   /* the raster has no sub-pixel */
     const float dx = x2 - x1, dy = y2 - y1;
     const float len = dx * dx + dy * dy;
@@ -1849,13 +1680,8 @@ static void MenuKit_DrawCircle(float cx, float cy, float r, uint32_t rgba, int f
     else       Canvas_Stroke(xy, segments, rgba, 1.0f, true);
 }
 
-/* Text goes into the shape batch as untextured quads, one per horizontal run of
-   lit font pixels. The immediate-mode textured path in this GL fork binds a raster
-   we build but never samples our pixels, while the shape batch is proven to
-   render on device - so reuse the path that works instead of guessing at
-   RenderWare internals. Runs rather than single pixels keep the count low (a 5x7
-   glyph is ~14 quads). Ordering comes for free: shapes and text share one batch,
-   so a panel drawn after its label still covers it. */
+/* Emit text as untextured quads in the canvas batch. Each quad represents one
+   horizontal run of lit pixels in the 5x7 font; call order determines layering. */
 static void MenuKit_DrawText(float x, float y, const char* text, int scale, uint32_t rgba)
 {
     if(!text || !*text) return;
@@ -1935,12 +1761,8 @@ static MenuKitAPI g_api = {
 
 const MenuKitAPI* GetMenuAPI(void) { return &g_api; }
 
-/* Dispose every widget this framework still owns, then drop all state. Called
-   from the host mod's ON_MOD_UNLOAD via the framework main.cpp. Each live
-   object is destroyed through its virtual destructor (the game's own recipe),
-   so this is a real free, not a pool-slot NULL: no 0x200-per-widget leak on
-   reload. FreeWidgetSlot re-checks the slot still holds OUR widget, so if the
-   game already reclaimed one we skip it instead of double-freeing. */
+/* Destroy widgets still owned by the framework and clear the client callback.
+   FreeWidgetSlot checks pool ownership before calling the widget destructor. */
 extern "C" __attribute__((visibility("default")))
 void MenuKit_Shutdown(void)
 {

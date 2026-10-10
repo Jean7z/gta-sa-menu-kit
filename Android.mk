@@ -1,9 +1,8 @@
 LOCAL_PATH := $(call my-dir)
 
 # ---- SA Menu Kit (framework) ----
-# arm64-v8a only (ver Application.mk). The module keeps its plain name as a
-# fallback so a stray armeabi-v7a APP_ABI fails loudly on the missing symbol
-# instead of silently shipping a .so with the wrong name.
+# arm64-v8a only; Application.mk pins the ABI. The module name matches AML's
+# library lookup name.
 include $(CLEAR_VARS)
 LOCAL_MODULE := AML_PSDK_MenuKit64
 LOCAL_CPP_EXTENSION := .cpp .cc
